@@ -58,6 +58,11 @@ class MemoryStreamer:
             "flags_found": [],
             "bash_commands": [],
             "env_vars": [],
+            "extracted_passwords": [],
+            "reverse_shells": [],
+            "http_requests": [],
+            "carved_elfs": [],
+            "ntlm_hashes": [],
             "suspicious_patterns": {},
             "volatility_recommendations": []
         }
@@ -75,6 +80,10 @@ class MemoryStreamer:
 
         seen_commands = set()
         seen_env = set()
+        seen_passwords = set()
+        seen_rev_shells = set()
+        seen_elf_offsets = set()
+        split_fragments: Dict[str, Dict[int, str]] = {}
 
         try:
             with open(filepath, "rb") as f:
@@ -233,6 +242,176 @@ class MemoryStreamer:
                         if ff_str and ff_str not in results["scripts_found"]:
                             results["scripts_found"].append(ff_str)
 
+                    # 9. Scrape Command-Line Passwords (OpenSSL, 7z, GPG, unzip, sshpass, curl -u, etc.)
+                    pwd_patterns = [
+                        rb"(?:openssl\s+enc\s+[^\r\n]*?(?:-k|-pass\s+pass:)\s*['\"]?([^\s\"'\r\n]{3,60})['\"]?)",
+                        rb"(?:(?:7z|7za|zip|unzip)\s+[^\r\n]*?-(?:p|P)\s*['\"]?([^\s\"'\r\n]{3,60})['\"]?)",
+                        rb"(?:gpg\s+[^\r\n]*?--passphrase\s+['\"]?([^\s\"'\r\n]{3,60})['\"]?)",
+                        rb"(?:sshpass\s+-p\s*['\"]?([^\s\"'\r\n]{3,60})['\"]?)",
+                        rb"(?:curl\s+[^\r\n]*?-u\s+[^:\s\r\n]+:([^\s\"'\r\n]{3,60}))",
+                        rb"(?:echo\s+['\"]?([^\s\"'\r\n]{4,60})['\"]?\s*\|\s*sudo\s+-S)"
+                    ]
+                    for pp in pwd_patterns:
+                        for m_pwd in re.finditer(pp, current_buffer, re.IGNORECASE):
+                            pwd_str = m_pwd.group(1).decode("latin-1", errors="ignore").strip()
+                            if pwd_str and pwd_str not in seen_passwords and len(pwd_str) >= 3:
+                                seen_passwords.add(pwd_str)
+                                results["extracted_passwords"].append(pwd_str)
+
+                    # 10. Scrape Reverse Shells & Socket C2 strings
+                    rev_matches = re.findall(
+                        rb"(?:(?:bash\s+-i\s+>&|/bin/sh\s+-i\s+>&|/bin/bash\s+-i\s+>&)?\s*(?:/dev/tcp/[0-9\.]+|/dev/udp/[0-9\.]+)/[0-9]{2,5}|(?:nc|ncat|socat)\s+(?:-[le]|exec:)[^\r\n]{5,100})",
+                        current_buffer,
+                        re.IGNORECASE
+                    )
+                    for rm in rev_matches:
+                        rm_str = rm.decode("latin-1", errors="ignore").strip()
+                        if rm_str and rm_str not in seen_rev_shells:
+                            seen_rev_shells.add(rm_str)
+                            results["reverse_shells"].append(rm_str)
+
+                    # 11. Scrape HTTP Requests, JWT Tokens & Cookies in RAM
+                    jwt_matches = re.findall(rb"eyJ[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{15,}\.[A-Za-z0-9_\-]{10,}", current_buffer)
+                    for jm in jwt_matches:
+                        jwt_str = jm.decode("latin-1", errors="ignore").strip()
+                        if jwt_str not in results["http_requests"]:
+                            results["http_requests"].append(f"[JWT] {jwt_str}")
+                            # Hunt flags in decoded JWT payload (second segment)
+                            try:
+                                payload_b64 = jwt_str.split(".")[1]
+                                pad_len = (4 - len(payload_b64) % 4) % 4
+                                dec_jwt = base64.b64decode((payload_b64 + "=" * pad_len).encode("ascii")).decode("latin-1", errors="ignore")
+                                for fl in self.string_hunter.hunt_flags(dec_jwt):
+                                    fl["encoding"] = f"In-Memory JWT Payload ({fl['encoding']})"
+                                    results["flags_found"].append(fl)
+                                    if on_flag_found:
+                                        on_flag_found(fl)
+                            except Exception:
+                                pass
+
+                    http_matches = re.findall(rb"(?:GET|POST|PUT|DELETE)\s+/[^\s\r\n]{1,120}\s+HTTP/1\.[01]", current_buffer)
+                    for hm in http_matches:
+                        hm_str = hm.decode("latin-1", errors="ignore").strip()
+                        if hm_str not in results["http_requests"]:
+                            results["http_requests"].append(hm_str)
+
+                    # 12. Multi-Part Split Flag Assembler (e.g. part 1/3, part 2/3, part 3/3, or part_1 = '...')
+                    # Pattern A: Fraction format (part 1/3, part 1 of 3)
+                    pat_frac = rb"(?:#|\(|\[)?part\s*(\d+)\s*(?:/|of)\s*(\d+)(?:#|\)|\])?\s*[:=]?\s*['\"]?([A-Za-z0-9_\-\{\}\!@#\$%\^&\*\+=~`]+)"
+                    for pm in re.finditer(pat_frac, current_buffer, re.IGNORECASE):
+                        try:
+                            p_idx = int(pm.group(1))
+                            total_parts = int(pm.group(2))
+                            p_text = pm.group(3).decode("latin-1", errors="ignore").strip().rstrip("'\"")
+                            grp_key = f"fraction_{total_parts}"
+                            if grp_key not in split_fragments:
+                                split_fragments[grp_key] = {}
+                            split_fragments[grp_key][p_idx] = p_text
+
+                            if len(split_fragments[grp_key]) == total_parts:
+                                assembled = "".join(split_fragments[grp_key][i] for i in range(1, total_parts + 1))
+                                if self.string_hunter.is_valid_flag(assembled):
+                                    assembled_fl = {
+                                        "flag": assembled,
+                                        "encoding": f"Assembled Multi-Part ({total_parts} fragments)",
+                                        "context": f"Stitched {total_parts} memory parts: {split_fragments[grp_key]}"
+                                    }
+                                    if not any(f["flag"] == assembled for f in results["flags_found"]):
+                                        results["flags_found"].append(assembled_fl)
+                                        if on_flag_found:
+                                            on_flag_found(assembled_fl)
+                        except Exception:
+                            pass
+
+                    # Pattern B: Variable assignment (part_1 = '...', $part1 = '...')
+                    pat_var = rb"(?:\$|var\s+|let\s+)?part_?(\d+)\s*=\s*['\"]([A-Za-z0-9_\-\{\}\!@#\$%\^&\*\+=~`]+)['\"]"
+                    for pm in re.finditer(pat_var, current_buffer, re.IGNORECASE):
+                        try:
+                            p_idx = int(pm.group(1))
+                            p_text = pm.group(2).decode("latin-1", errors="ignore").strip()
+                            grp_key = "var_parts"
+                            if grp_key not in split_fragments:
+                                split_fragments[grp_key] = {}
+                            split_fragments[grp_key][p_idx] = p_text
+
+                            # Try assembling up to maximum known part index
+                            max_idx = max(split_fragments[grp_key].keys())
+                            if all(i in split_fragments[grp_key] for i in range(1, max_idx + 1)):
+                                assembled = "".join(split_fragments[grp_key][i] for i in range(1, max_idx + 1))
+                                if self.string_hunter.is_valid_flag(assembled):
+                                    assembled_fl = {
+                                        "flag": assembled,
+                                        "encoding": f"Assembled Multi-Part ({max_idx} variables)",
+                                        "context": f"Stitched variables: {split_fragments[grp_key]}"
+                                    }
+                                    if not any(f["flag"] == assembled for f in results["flags_found"]):
+                                        results["flags_found"].append(assembled_fl)
+                                        if on_flag_found:
+                                            on_flag_found(assembled_fl)
+                        except Exception:
+                            pass
+
+                    # 13. Vim Swap File buffer recovery (b0VIM magic)
+                    vim_pos = 0
+                    while True:
+                        v_idx = current_buffer.find(b"b0VIM", vim_pos)
+                        if v_idx == -1:
+                            break
+                        vim_pos = v_idx + 5
+                        # Vim swap block is typically 4096 bytes
+                        swp_block = current_buffer[v_idx : min(len(current_buffer), v_idx + 4096)]
+                        for fl in self.string_hunter.hunt_flags(swp_block):
+                            fl["context"] = f"[Vim Swap Buffer @ 0x{chunk_offset + v_idx:x}] {fl.get('context', '')}"
+                            results["flags_found"].append(fl)
+                            if on_flag_found:
+                                on_flag_found(fl)
+
+                    # 14. In-Memory ELF Carving (LKM .ko, injected binaries, core dumps)
+                    if len(results["carved_elfs"]) < 10:
+                        elf_pos = 0
+                        while True:
+                            e_idx = current_buffer.find(b"\x7fELF", elf_pos)
+                            if e_idx == -1:
+                                break
+                            elf_pos = e_idx + 4
+                            if e_idx + 64 > len(current_buffer):
+                                break
+                            ei_class = current_buffer[e_idx + 4]
+                            ei_data = current_buffer[e_idx + 5]
+                            if ei_class not in (1, 2) or ei_data != 1:  # 32/64-bit little endian
+                                continue
+                            e_type = struct.unpack("<H", current_buffer[e_idx + 16 : e_idx + 18])[0]
+                            if e_type not in (1, 2, 3, 4):  # REL(1)=LKM, EXEC(2), DYN(3), CORE(4)
+                                continue
+
+                            abs_elf_off = chunk_offset + e_idx
+                            if abs_elf_off not in seen_elf_offsets:
+                                seen_elf_offsets.add(abs_elf_off)
+                                type_names = {1: "LKM/Relocatable", 2: "Executable", 3: "SharedLib", 4: "CoreDump"}
+                                t_name = type_names.get(e_type, "ELF")
+                                elf_sample = current_buffer[e_idx : min(len(current_buffer), e_idx + 1024 * 1024)]
+                                results["carved_elfs"].append({
+                                    "offset": hex(abs_elf_off),
+                                    "type": t_name,
+                                    "class": "64-bit" if ei_class == 2 else "32-bit"
+                                })
+                                for fl in self.string_hunter.hunt_flags(elf_sample):
+                                    fl["context"] = f"[Carved {t_name} @ 0x{abs_elf_off:x}] {fl.get('context', '')}"
+                                    results["flags_found"].append(fl)
+                                    if on_flag_found:
+                                        on_flag_found(fl)
+                            if len(results["carved_elfs"]) >= 10:
+                                break
+
+                    # 15. Windows NTLM Hash Scanner in RAM
+                    ntlm_matches = re.finditer(
+                        rb"(?:Administrator|Admin|Guest|User|ctfplayer|[A-Za-z0-9_\-\.]{3,20}):\d{3,5}:[0-9a-fA-F]{32}:([0-9a-fA-F]{32})",
+                        current_buffer
+                    )
+                    for nm in ntlm_matches:
+                        ntlm_line = nm.group(0).decode("latin-1", errors="ignore").strip()
+                        if ntlm_line not in results["ntlm_hashes"]:
+                            results["ntlm_hashes"].append(ntlm_line)
 
                     prev_overlap = chunk[-self.overlap:] if len(chunk) >= self.overlap else chunk
 

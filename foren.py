@@ -449,6 +449,40 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
                     for fl in string_hunter.hunt_flags(sc):
                         on_instant_flag(fl, "In-Memory Script")
 
+            if m_res.get("extracted_passwords"):
+                print(f" [+] \033[1;32mKunci/Password ditemukan dalam command RAM ({len(m_res['extracted_passwords'])}):\033[0m")
+                for pw in m_res["extracted_passwords"]:
+                    print(f"     -> \033[1;32m'{pw}'\033[0m")
+                    candidate_passwords.add(pw)
+
+            if m_res.get("reverse_shells"):
+                print(f" \033[1;31m[!] Reverse Shell / C2 Sockets terdeteksi ({len(m_res['reverse_shells'])}):\033[0m")
+                for rs in m_res["reverse_shells"][:5]:
+                    print(f"     -> {rs}")
+
+            if m_res.get("http_requests"):
+                print(f" [+] HTTP / JWT Buffers di RAM ({len(m_res['http_requests'])}):")
+                for hr in m_res["http_requests"][:5]:
+                    print(f"     -> {hr[:100]}")
+
+            if m_res.get("carved_elfs"):
+                print(f" [+] In-Memory ELF Binaries Carved ({len(m_res['carved_elfs'])}):")
+                for ce in m_res["carved_elfs"][:5]:
+                    print(f"     -> Offset {ce['offset']}: {ce['type']} ({ce['class']})")
+
+            if m_res.get("ntlm_hashes"):
+                print(f" [+] NTLM Hashes di RAM ({len(m_res['ntlm_hashes'])}):")
+                for nh in m_res["ntlm_hashes"][:5]:
+                    print(f"     -> {nh}")
+
+            # Fallback jika belum ada flag: visual framebuffer inspection
+            if not all_discovered_flags:
+                fb_res = memory_streamer.scan_raw_framebuffer(file_path, output_dir=target_out_dir)
+                if fb_res.get("saved_images"):
+                    print(f" [+] Raw Framebuffers Carved ({len(fb_res['saved_images'])} BMP desktop screenshots tersimpan)")
+                    for img in fb_res["saved_images"][:3]:
+                        print(f"     -> {img}")
+
             # --- Step B3: Tampilkan Volatility recommendations ---
             if m_res.get("volatility_recommendations"):
                 print(f"\n \033[1;36m[*] Volatility 3 — Command yang disarankan:\033[0m")

