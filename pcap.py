@@ -35,8 +35,16 @@ def main():
         print(f"[*] USB Mouse Drawing saved: {res['usb_mouse_drawing']}")
     if res.get("tcp_flags_covert"):
         print(f"[*] TCP Flags Covert: {res['tcp_flags_covert']}")
-    if res.get("timing_stego"):
-        print(f"[*] Timing Interval Stego: {res['timing_stego']}")
+    if res.get("wpa_handshake_detected"):
+        print(f" [!] WPA 4-way Handshake terdeteksi! Gunakan: aircrack-ng {filepath} -w <wordlist>")
+    if res.get("dns_exfil_data"):
+        print(f"[*] DNS Exfiltration Data: {res['dns_exfil_data']}")
+    if res.get("icmp_exfil_data"):
+        print(f"[*] ICMP Tunneling Data: {res['icmp_exfil_data']}")
+    if res.get("rtp_audio_bytes"):
+        print(f"[*] VoIP RTP Audio Streams: {res['rtp_audio_bytes']} bytes")
+    if res.get("protocols"):
+        print(f"[*] Protokol terdeteksi: {', '.join(res['protocols'])}")
 
 if __name__ == "__main__":
     main()

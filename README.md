@@ -68,11 +68,29 @@ Semua hasil scan tersimpan di folder `results/out_<filename>_<timestamp>/`:
 
 ---
 
-## 🧪 Verifikasi Pengujian
+## 🧪 Verifikasi Pengujian & Trainer Benchmark
 
+### 1. Battery Test (Unit Tests)
 Jalankan battery test untuk memastikan seluruh engine berfungsi normal:
 ```bash
 python -m unittest discover tests
 ```
 Semua 34 unit test mencakup seluruh skenario penanganan format file, steganografi, network, dan ekstraksi memori RAM.
+
+### 2. PCAP Benchmark & Trainer (10 Skenario CTF Nyata)
+Simulasi dan benchmark otomatis 10 soal network forensics dari HackToday, IPB, PicoCTF, dan kompetisi nasional:
+```bash
+python trainer_pcap.py
+```
+Mencakup pengujian otomatis:
+- USB HID Keyboard Keystroke injection
+- PicoCTF UDP Port Delta steganography (*shark on wire 2*)
+- ICMP Echo data tunneling
+- DNS Subdomain Base64 exfiltration
+- HTTP POST multipart file upload (*shark on wire 1*)
+- HTTP Response Gzip compressed body carving
+- FTP plaintext credentials & FTP-DATA transfer
+- Packet Inter-Arrival Timing stego (EHAX 2026)
+- TCP 6-bit flags covert channel
+- VoIP RTP audio stream payload
 

@@ -148,6 +148,9 @@ class PcapAnalyzer:
         icmp_payloads: List[bytes] = []
         dns_queries: List[str] = []
         hid_reports: List[bytes] = []
+        udp_port_seqs: Dict[Tuple[str, int], List[int]] = {}
+        rtp_payloads: List[bytes] = []
+        eapol_count = 0
 
         # Linktype 1: Ethernet; Linktype 220: USB Linux; Linktype 249: USBPcap
         is_usb = linktype in (220, 249)
@@ -162,6 +165,11 @@ class PcapAnalyzer:
                     hid_reports.append(hid_cand)
                     results["protocols"].add("USB_HID")
                     continue
+
+            # Check EAPOL / WPA Handshake (802.1X EtherType 0x888e)
+            if len(pkt) >= 14 and pkt[12:14] == b"\x88\x8e":
+                results["protocols"].add("EAPOL_WPA")
+                eapol_count += 1
 
             # Check Ethernet (14 bytes header)
             if len(pkt) > 14 and pkt[12:14] == b"\x08\x00":  # IPv4
@@ -200,16 +208,35 @@ class PcapAnalyzer:
                             results["protocols"].add("HTTP")
                             self._extract_http_creds(tcp_payload, results)
 
+                        # Check FTP (Port 21 or FTP command strings)
+                        if dst_port == 21 or src_port == 21:
+                            results["protocols"].add("FTP")
+                            for fc in re.findall(r"(?:USER|PASS|RETR|STOR)\s+([^\r\n]+)", tcp_payload.decode("latin-1", errors="ignore"), re.IGNORECASE):
+                                results["credentials"].append(f"FTP: {fc.strip()}")
+
                 # UDP (Proto 17)
                 elif proto == 17 and len(l4_data) >= 8:
                     results["protocols"].add("UDP")
                     src_port, dst_port = struct.unpack(">HH", l4_data[:4])
                     udp_payload = l4_data[8:]
+
+                    # Track UDP source ports for covert channel (PicoCTF 'shark on wire 2' pattern)
+                    dest_ep = (dst_ip, dst_port)
+                    if dest_ep not in udp_port_seqs:
+                        udp_port_seqs[dest_ep] = []
+                    udp_port_seqs[dest_ep].append(src_port)
+
+                    # DNS (Port 53)
                     if dst_port == 53 or src_port == 53:
                         results["protocols"].add("DNS")
                         query = self._extract_dns_query(udp_payload)
                         if query:
                             dns_queries.append(query)
+
+                    # VoIP RTP Audio (Payload Type 0=PCMU or 8=PCMA)
+                    if len(udp_payload) >= 12 and udp_payload[0] == 0x80 and (udp_payload[1] & 0x7f) in (0, 8):
+                        results["protocols"].add("VoIP_RTP")
+                        rtp_payloads.append(udp_payload[12:])
 
                 # ICMP (Proto 1)
                 elif proto == 1 and len(l4_data) >= 8:
@@ -218,6 +245,12 @@ class PcapAnalyzer:
                     # Echo Request (8) or Echo Reply (0)
                     if icmp_type in (8, 0) and len(l4_data) > 8:
                         icmp_payloads.append(l4_data[8:])
+
+        if eapol_count >= 4:
+            results["wpa_handshake_detected"] = True
+            results["suspicious_patterns"]["WPA_Handshake"] = [
+                f"Ditemukan {eapol_count} EAPOL frames (WPA 4-way handshake). Rekomendasi: `aircrack-ng <file> -w /path/to/wordlist.txt`"
+            ]
 
         results["streams_found"] = len(tcp_streams)
 
@@ -295,6 +328,103 @@ class PcapAnalyzer:
         # 7. Check Packet Interval Timing Stego (EHAX 2026 pattern from network-advanced.md)
         if timestamps:
             self._decode_timing_interval_stego(timestamps, results)
+
+        # 8. Check UDP Port Delta Covert Stego (PicoCTF 'shark on wire 2' pattern)
+        if udp_port_seqs:
+            self._decode_udp_port_stego(udp_port_seqs, results)
+
+        # 9. Carve HTTP Response Bodies (Images, Archives, Gzip decompressed files)
+        if tcp_streams:
+            self._carve_http_bodies(tcp_streams, results)
+
+        # 10. Process VoIP RTP Audio Payload
+        if rtp_payloads:
+            self._process_rtp_audio(rtp_payloads, results)
+
+    def _decode_udp_port_stego(self, udp_port_seqs: Dict[Tuple[str, int], List[int]], results: Dict[str, Any]):
+        """
+        PicoCTF 'shark on wire 2' UDP Port Stego Solver:
+        - Detects flags encoded in UDP source ports to a destination (e.g. port - 5000 = ASCII)
+        """
+        for (dst_ip, dst_port), src_ports in udp_port_seqs.items():
+            if len(src_ports) < 8:
+                continue
+
+            # Try candidate port offsets: 5000 (PicoCTF), 20000, 10000, 0, or modulo 256
+            for offset in (5000, 10000, 20000, 0):
+                chars = []
+                for p in src_ports:
+                    val = p - offset if offset else p % 256
+                    if 32 <= val <= 126:
+                        chars.append(chr(val))
+                    elif val in (10, 13):
+                        chars.append(" ")
+
+                if len(chars) >= 8:
+                    candidate_str = "".join(chars)
+                    flags = self.string_hunter.hunt_flags(candidate_str)
+                    for fl in flags:
+                        fl["encoding"] = f"UDP Port Delta (offset {offset}) ({fl['encoding']})"
+                        fl["context"] = f"Dst {dst_ip}:{dst_port} sequence of {len(src_ports)} packets: {fl.get('context', '')}"
+                        results["flags_found"].append(fl)
+
+    def _carve_http_bodies(self, tcp_streams: Dict, results: Dict[str, Any]):
+        """
+        Carve and decompress transferred files (PNG, ZIP, gzip) from HTTP response streams.
+        """
+        import zlib
+        for stream_id, payload in tcp_streams.items():
+            payload_bytes = bytes(payload)
+            # Find HTTP responses (HTTP/1.0 200 OK or HTTP/1.1 200 OK)
+            for m in re.finditer(rb"HTTP/1\.[01]\s+\d{3}[^\r\n]*\r\n", payload_bytes):
+                h_start = m.start()
+                h_end = payload_bytes.find(b"\r\n\r\n", h_start)
+                if h_end == -1:
+                    continue
+                header_text = payload_bytes[h_start:h_end].decode("latin-1", errors="ignore")
+                body_start = h_end + 4
+
+                # Determine body length
+                m_len = re.search(r"Content-Length:\s*(\d+)", header_text, re.IGNORECASE)
+                if m_len:
+                    b_len = int(m_len.group(1))
+                    body = payload_bytes[body_start : body_start + b_len]
+                else:
+                    body = payload_bytes[body_start:]
+
+                # Decompress gzip/deflate/zlib if applicable
+                is_gzip = "gzip" in header_text.lower() or "deflate" in header_text.lower() or body.startswith(b"\x1f\x8b\x08") or body.startswith(b"\x78\x9c")
+                if is_gzip:
+                    try:
+                        import gzip
+                        decompressed = gzip.decompress(body)
+                        body = decompressed
+                    except Exception:
+                        try:
+                            decompressed = zlib.decompress(body, 16 + zlib.MAX_WBITS)
+                            body = decompressed
+                        except Exception:
+                            try:
+                                body = zlib.decompress(body, -15)
+                            except Exception:
+                                try:
+                                    body = zlib.decompress(body)
+                                except Exception:
+                                    pass
+
+                # Scan flags in the carved body
+                for fl in self.string_hunter.hunt_flags(body):
+                    fl["encoding"] = f"HTTP Carved Body ({fl['encoding']})"
+                    fl["context"] = f"Stream {stream_id[0]} <-> {stream_id[1]}: {fl.get('context', '')}"
+                    results["flags_found"].append(fl)
+
+    def _process_rtp_audio(self, rtp_payloads: List[bytes], results: Dict[str, Any]):
+        """Extract VoIP RTP audio stream bytes and check for flags."""
+        full_audio = b"".join(rtp_payloads)
+        results["rtp_audio_bytes"] = len(full_audio)
+        for fl in self.string_hunter.hunt_flags(full_audio):
+            fl["encoding"] = f"VoIP RTP Audio ({fl['encoding']})"
+            results["flags_found"].append(fl)
 
     def _decode_timing_interval_stego(self, timestamps: List[float], results: Dict[str, Any]):
         """
