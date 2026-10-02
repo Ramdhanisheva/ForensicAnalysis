@@ -18,31 +18,26 @@ class Reporter:
 
     def print_terminal_banner(self, filename: str):
         """Display clean terminal header."""
-        print(f"\n\033[1;36m[*] Analysis Foren: \033[1;33m{filename}\033[0m\n")
+        print(f"\n[*] Tool Analysis Foren: {filename}\n")
 
     def print_section(self, title: str):
         """Display section divider."""
-        print(f"\033[1;35m--- [ {title} ] ---\033[0m")
+        print(f"--- [ {title} ] ---")
 
     def print_flag(self, flag_info: Dict[str, str]):
         """Highlight discovered flag in terminal."""
         flag = flag_info.get("flag", "")
         enc = flag_info.get("encoding", "Plaintext")
-        ctx = flag_info.get("context", "")
-        print(f"\033[1;42;37m [!] FLAG DETECTED: \033[0m \033[1;32m{flag}\033[0m")
-        print(f"    \033[1;34mMethod:\033[0m {enc}")
-        if ctx:
-            print(f"    \033[1;30mContext:\033[0m {ctx[:100]}")
+        print(f"\n[+] Flag found: {flag}")
+        if enc:
+            print(f"    Method: {enc}")
 
     def print_instant_bingo(self, flag: str, method: str):
-        """Immediately print high-priority BINGO banner when a flag is caught in real-time."""
-        w = 68
-        border = "+" + "=" * w + "+"
-        print("\n" + "\033[1;42;30m" + border + "\033[0m")
-        print("\033[1;42;30m" + f"|  [BINGO! FLAG DITEMUKAN SECARA INSTAN] {'':<{w-41}}|" + "\033[0m")
-        print("\033[1;42;37m" + f"|  FLAG: {flag:<{w-9}}|" + "\033[0m")
-        print("\033[1;42;30m" + f"|  Sumber/Metode: {method:<{w-18}}|" + "\033[0m")
-        print("\033[1;42;30m" + border + "\033[0m\n")
+        """Immediately print clean flag output when caught."""
+        print(f"\n[+] Flag found: {flag}")
+        if method:
+            print(f"    Source: {method}\n")
+
 
     def print_triage_advisory(self, assessment: Dict[str, Any]):
         """Display rule-based forensic triage evaluation."""

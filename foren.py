@@ -1057,28 +1057,28 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: O
 
     out_dir_abs = os.path.abspath(target_out_dir)
     if all_discovered_flags:
-        print("\n\033[1;42;37m" + "=" * 70 + "\033[0m")
-        print("\033[1;42;37m" + f"  🚩 [BINGO!] TOTAL FLAG DITEMUKAN: {len(all_discovered_flags)}".ljust(68) + "\033[0m")
+        print("\n" + "=" * 60)
+        print("[+] Flag found:")
         for idx, fl in enumerate(all_discovered_flags, 1):
-            print(f"\033[1;42;30m   [{idx}] FLAG  : {fl.get('flag')} \033[0m")
-            print(f"\033[1;42;30m       METODE: {fl.get('encoding', 'Plaintext')} \033[0m")
-        print(f"\033[1;42;30m   📂 FOLDER HASIL LENGKAP: {out_dir_abs} \033[0m")
-        print("\033[1;42;37m" + "  👉 SILAKAN CEK HASIL DI ATAS & SUBMIT KE SCOREBOARD!".ljust(68) + "\033[0m")
-        print("\033[1;42;37m" + "=" * 70 + "\033[0m\n")
+            print(f"    - {fl.get('flag')}")
+            if fl.get('encoding'):
+                print(f"      Method: {fl.get('encoding')}")
+        print(f"\n[+] Output: {out_dir_abs}")
+        print("=" * 60 + "\n")
     else:
-        print("\n\033[1;44;37m" + "=" * 70 + "\033[0m")
-        print("\033[1;44;37m" + "  🔍 [SELESAI] ANALISIS FORENSIK SELESAI".ljust(68) + "\033[0m")
-        print(f"\033[1;44;30m   📂 FOLDER ARTEFAK / HASIL: {out_dir_abs} \033[0m")
+        print("\n" + "-" * 60)
+        print("[*] Analysis done.")
+        print(f"[*] Output directory: {out_dir_abs}")
         if saved_artifacts:
-            print(f"\033[1;44;30m   📦 {len(saved_artifacts)} file artefak berhasil diekstrak! \033[0m")
-        print("\033[1;44;37m" + "  👉 SILAKAN BUKA & PERIKSA FOLDER HASIL DI ATAS!".ljust(68) + "\033[0m")
-        print("\033[1;44;37m" + "=" * 70 + "\033[0m\n")
+            print(f"[*] Extracted artifacts: {len(saved_artifacts)} file(s)")
+        print("-" * 60 + "\n")
 
     return {
         "target_file": file_path,
         "all_flags": all_discovered_flags,
         "saved_artifacts": saved_artifacts
     }
+
 
 
 
