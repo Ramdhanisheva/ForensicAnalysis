@@ -50,17 +50,34 @@ class StegoEngine:
             "anomalies": []
         }
         data = None
+        target_path = target if isinstance(target, str) and os.path.exists(target) else None
+
         if isinstance(target, bytes):
             data = target
-        elif isinstance(target, str) and os.path.exists(target):
+        elif target_path:
             try:
-                with open(target, "rb") as f:
+                with open(target_path, "rb") as f:
                     data = f.read(20 * 1024 * 1024)
             except Exception:
                 pass
         if not data:
             return results
 
+        # 0. Check for corrupted PNG magic header/trailer (Magic Show pattern)
+        if b"IHDR" in data[:64] and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            fixed_png = self.repair_corrupted_png_magic(data)
+            if fixed_png:
+                results["anomalies"].append("Repaired corrupted PNG magic header/trailer")
+                data = fixed_png
+                # Scan repaired QR code
+                qr_flags = self.scan_qr_code_from_bytes(data)
+                results["flags_found"].extend(qr_flags)
+
+        # 1. Standard QR code scan on image
+        qr_flags = self.scan_qr_code_from_bytes(data)
+        results["flags_found"].extend(qr_flags)
+
+        # 2. PNG Stego & Zsteg
         if data.startswith(b"\x89PNG"):
             p_res = self.analyze_png(data)
             results["flags_found"].extend(p_res.get("extracted_flags", []))
@@ -69,14 +86,127 @@ class StegoEngine:
                 results["anomalies"].extend([f"PNG CRC Error: {e}" for e in p_res["crc_errors"]])
             pal_res = self.analyze_png_palette_slack(data)
             results["flags_found"].extend(pal_res.get("extracted_flags", []))
+
+            # Run zsteg on target PNG
+            if target_path:
+                zsteg_flags = self.run_zsteg_on_file(target_path)
+                results["flags_found"].extend(zsteg_flags)
+
+        # 3. JPEG DQT & Height Tampering
         elif data.startswith(b"\xff\xd8\xff"):
             dqt_res = self.analyze_jpeg_dqt(data)
             results["flags_found"].extend(dqt_res.get("extracted_flags", []))
+
+            # Explore JPEG Height Tampering (SOF0/SOF2 cropping)
+            if target_path:
+                height_fixes = self.explore_jpeg_height(data, target_path)
+                results["anomalies"].extend(height_fixes)
+
+        # 4. BMP & Raw Pixels
         elif data.startswith(b"BM"):
             bmp_res = self.analyze_bmp_or_raw_pixels(data)
             results["flags_found"].extend(bmp_res.get("extracted_flags", []))
 
         return results
+
+    def repair_corrupted_png_magic(self, data: bytes) -> Optional[bytes]:
+        """Detect and repair tampered PNG magic header (e.g. \x89@K0...) and trailer (IUND -> IEND)."""
+        try:
+            ihdr_pos = data.find(b"IHDR")
+            if ihdr_pos == -1 or ihdr_pos > 32:
+                return None
+            fixed = bytearray(data)
+            fixed[0:8] = b"\x89PNG\r\n\x1a\n"
+            # Fix IEND trailer if corrupted
+            for corrupted_trailer in (b"IUND", b"1END", b"iEND", b"IEnd"):
+                t_pos = fixed.rfind(corrupted_trailer)
+                if t_pos != -1 and t_pos >= len(fixed) - 32:
+                    fixed[t_pos:t_pos+4] = b"IEND"
+            # Save repaired image artifact
+            repaired_out = os.path.join(self.output_dir, "repaired_png_magic.png")
+            with open(repaired_out, "wb") as f:
+                f.write(fixed)
+            return bytes(fixed)
+        except Exception:
+            return None
+
+    def scan_qr_code_from_bytes(self, image_data: bytes) -> List[Dict[str, str]]:
+        """Decode QR codes / barcodes using zbarimg via WSL or pyzbar."""
+        flags: List[Dict[str, str]] = []
+        if len(image_data) < 64:
+            return flags
+
+        tmp_path = os.path.join(self.output_dir, "_temp_qr_scan.png")
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(image_data)
+
+            # Try zbarimg via WSL
+            wsl_p = to_wsl_path(tmp_path)
+            cmd = ["wsl", "-u", "root", "-d", "kali-linux", "zbarimg", "-q", "--raw", wsl_p]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            if proc.returncode == 0 and proc.stdout.strip():
+                for line in proc.stdout.splitlines():
+                    clean_line = line.strip()
+                    if clean_line:
+                        for fl in self.string_hunter.hunt_flags(clean_line):
+                            fl["encoding"] = f"QR Code (zbarimg) -> {fl['encoding']}"
+                            flags.append(fl)
+        except Exception:
+            pass
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        return flags
+
+    def run_zsteg_on_file(self, win_path: str) -> List[Dict[str, str]]:
+        """Execute zsteg via WSL and harvest all embedded flags."""
+        flags: List[Dict[str, str]] = []
+        try:
+            wsl_p = to_wsl_path(win_path)
+            cmd = ["wsl", "-u", "root", "-d", "kali-linux", "zsteg", "-a", wsl_p]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            if proc.stdout:
+                for fl in self.string_hunter.hunt_flags(proc.stdout):
+                    fl["encoding"] = f"Zsteg LSB Multi-Plane ({fl['encoding']})"
+                    flags.append(fl)
+        except Exception:
+            pass
+        return flags
+
+    def explore_jpeg_height(self, data: bytes, orig_path: str) -> List[str]:
+        """Automatically repair/expand cropped JPEG height (SOF0/SOF2 marker tampering)."""
+        anomalies = []
+        try:
+            # Search for SOF0 (0xFFC0) or SOF2 (0xFFC2)
+            pos = 0
+            while pos < len(data) - 9:
+                if data[pos] == 0xFF and data[pos+1] in (0xC0, 0xC2):
+                    sof_len = struct.unpack(">H", data[pos+2:pos+4])[0]
+                    precision = data[pos+4]
+                    height, width = struct.unpack(">HH", data[pos+5:pos+9])
+                    anomalies.append(f"JPEG SOF marker detected: {width}x{height} (precision={precision})")
+
+                    # Generate expanded height images (1.5x, 2.0x, 2.5x, 3.0x)
+                    for multiplier in (1.5, 2.0, 3.0):
+                        new_h = int(height * multiplier)
+                        if new_h <= 65535:
+                            fixed = bytearray(data)
+                            fixed[pos+5:pos+7] = struct.pack(">H", new_h)
+                            base_name = os.path.basename(orig_path)
+                            out_name = os.path.join(self.output_dir, f"height_{int(multiplier*100)}pct_{base_name}")
+                            with open(out_name, "wb") as f:
+                                f.write(fixed)
+                            anomalies.append(f"Generated height-expanded JPEG ({int(multiplier*100)}% height: {width}x{new_h}): {out_name}")
+                    break
+                pos += 1
+        except Exception:
+            pass
+        return anomalies
 
     def analyze_png(self, data: bytes) -> Dict[str, Any]:
         """

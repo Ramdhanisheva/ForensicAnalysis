@@ -6,7 +6,7 @@ Formats findings into terminal visual output, JSON reports, and Markdown writeup
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class Reporter:
@@ -17,12 +17,8 @@ class Reporter:
         os.makedirs(self.output_dir, exist_ok=True)
 
     def print_terminal_banner(self, filename: str):
-        """Display stylish terminal header."""
-        border = "=" * 70
-        print(f"\n\033[1;36m{border}\033[0m")
-        print(f"\033[1;32m [+] Forensics Analysis Suite\033[0m")
-        print(f"\033[1;33m Target: {filename}\033[0m")
-        print(f"\033[1;36m{border}\033[0m\n")
+        """Display clean terminal header."""
+        print(f"\n\033[1;36m[*] Analysis Foren: \033[1;33m{filename}\033[0m\n")
 
     def print_section(self, title: str):
         """Display section divider."""
@@ -112,26 +108,9 @@ class Reporter:
             print("     -> Buka di Ghidra / IDA / Radare2 / Binwalk.")
             print("     -> Cek entropy biner dengan binwalk -E atau hexdump.")
 
-    def save_reports(self, report_data: Dict[str, Any]) -> Tuple_Path:
-        """Save report.json and report.md in output directory."""
-        json_path = os.path.join(self.output_dir, "report.json")
-        md_path = os.path.join(self.output_dir, "report.md")
-
-        # 1. Save JSON
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(report_data, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Warning: Failed to save JSON report: {e}")
-
-        # 2. Save Markdown
-        try:
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(self._generate_markdown(report_data))
-        except Exception as e:
-            print(f"Warning: Failed to save Markdown report: {e}")
-
-        return json_path, md_path
+    def save_reports(self, report_data: Dict[str, Any]) -> Tuple[str, str]:
+        """Disabled to keep competition workspace clean without bot/AI trace."""
+        return "", ""
 
     def _generate_markdown(self, data: Dict[str, Any]) -> str:
         """Build structured Markdown report."""

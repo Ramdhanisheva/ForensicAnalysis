@@ -40,6 +40,7 @@ from core.exif_inspector import ExifInspector
 from core.magic_carver import MagicCarver
 from core.memory_streamer import MemoryStreamer
 from core.pcap_analyzer import PcapAnalyzer
+from core.pdf_inspector import PDFInspector
 from core.peripheral_hunter import PeripheralHunter
 from core.reporter import Reporter
 from core.signal_engine import SignalEngine
@@ -49,7 +50,7 @@ from core.system_inspector import SystemInspector
 from core.triage import Triage
 
 
-def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: str = "results", delime: bool = False) -> Dict[str, Any]:
+def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: Optional[str] = None, delime: bool = False) -> Dict[str, Any]:
     """Jalankan deteksi tipe soal dan eksekusi analisa forensik terarah."""
     file_path = os.path.abspath(filepath)
     if not os.path.exists(file_path):
@@ -60,20 +61,24 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     file_name = os.path.basename(file_path)
     start_time = time.time()
 
-    target_out_dir = os.path.join(output_base, f"out_{file_name}_{int(datetime.datetime.now().timestamp())}")
+    # Tentukan direktori output artefak:
+    # Jika user secara spesifik memberikan argumen -o / --output, gunakan folder tersebut secara langsung.
+    if output_base and output_base != "results":
+        target_out_dir = os.path.abspath(output_base)
+    else:
+        target_out_dir = os.path.join(output_base or "results", f"out_{file_name}_{int(datetime.datetime.now().timestamp())}")
+
+    # Generate folder otomatis jika belum ada
     os.makedirs(target_out_dir, exist_ok=True)
 
     reporter = Reporter(target_out_dir)
 
-    print("\n" + "\033[1;36m" + "=" * 70 + "\033[0m")
-    print("\033[1;32m [*] DIGITAL FORENSIC ANALYSIS & TRIAGE\033[0m")
-    print(f"\033[1;33m Target: {file_name}\033[0m ({file_size:,} bytes)")
-    print("\033[1;36m" + "=" * 70 + "\033[0m\n")
+    print(f"\n\033[1;36m[*] Analysis Foren: \033[1;33m{file_name}\033[0m ({file_size:,} bytes)\033[0m\n")
 
     # Inisialisasi engine
     string_hunter = StringHunter()
     magic_carver = MagicCarver(target_out_dir)
-    exif_inspector = ExifInspector()
+    exif_inspector = ExifInspector(target_out_dir)
     stego_engine = StegoEngine(target_out_dir)
     pcap_analyzer = PcapAnalyzer(target_out_dir)
     ad1_parser = AD1Parser(target_out_dir)
@@ -84,6 +89,7 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     disk_inspector = DiskInspector(target_out_dir)
     signal_engine = SignalEngine(target_out_dir)
     peripheral_hunter = PeripheralHunter(target_out_dir)
+    pdf_inspector = PDFInspector(target_out_dir)
 
     all_discovered_flags: List[Dict[str, str]] = []
     seen_flag_strings = set()
@@ -124,32 +130,39 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     entropy = Triage.calculate_entropy(header_sample[:65536])
 
     # Kategori soal
+    actual_ext = Path(file_path).suffix.lower().lstrip(".")
     detected_cat = "General Binary / Unknown"
     name = primary.get("name", "Unknown")
 
-    if primary_ext in ("pcap", "pcapng") or "PCAP" in name:
+    if primary_ext in ("pcap", "pcapng") or actual_ext in ("pcap", "pcapng", "cap") or "PCAP" in name:
         detected_cat = "Network / Packet Capture (PCAP/PCAPNG)"
-    elif primary_ext in ("lime", "dmp", "vmem") or "Memory" in name:
+    elif primary_ext in ("lime", "dmp", "vmem") or actual_ext in ("lime", "dmp", "vmem", "mem") or "Memory" in name or header_sample.startswith((b"EMiL", b"LiME")):
         detected_cat = "RAM Memory Dump (LiME / Minidump)"
-    elif primary_ext in ("png", "jpg", "jpeg", "bmp", "gif") or "Image" in name:
+    elif primary_ext in ("png", "jpg", "jpeg", "bmp", "gif") or actual_ext in ("png", "jpg", "jpeg", "bmp", "gif", "webp") or "Image" in name or b"IHDR" in header_sample[:64]:
         detected_cat = "Citra Digital / Steganografi Gambar"
-    elif primary_ext == "svg" or header_sample.lstrip().startswith(b"<svg") or b"<svg" in header_sample[:512]:
+    elif primary_ext == "svg" or actual_ext == "svg" or header_sample.lstrip().startswith(b"<svg") or b"<svg" in header_sample[:512]:
         detected_cat = "Citra Vektor SVG / XML Steganografi"
-    elif primary_ext == "pdf" or header_sample.startswith(b"%PDF-"):
+    elif primary_ext == "pdf" or actual_ext == "pdf" or header_sample.startswith(b"%PDF-"):
         detected_cat = "Dokumen PDF / Redaction & Stream Forensics"
-    elif primary_ext in ("pptx", "docx", "xlsx"):
+    elif primary_ext in ("pptx", "docx", "xlsx") or actual_ext in ("pptx", "docx", "xlsx"):
         detected_cat = "Dokumen Office OpenXML (PPTX/DOCX/XLSX)"
-    elif primary_ext in ("wav", "mp3", "flac") or "Audio" in name:
+    elif primary_ext in ("wav", "mp3", "flac") or actual_ext in ("wav", "mp3", "flac") or "Audio" in name:
         detected_cat = "Audio / Steganografi Sinyal Suara"
-    elif primary_ext in ("sqlite", "db", "sqlite3") or "SQLite" in name:
+    elif primary_ext in ("sqlite", "db", "sqlite3") or actual_ext in ("sqlite", "db", "sqlite3") or "SQLite" in name:
         detected_cat = "Database Forensics (SQLite v3)"
-    elif primary_ext in ("evtx", "log") or "Event Log" in name:
+    elif primary_ext in ("evtx", "log") or actual_ext in ("evtx", "log") or "Event Log" in name:
         detected_cat = "Log Sistem (Windows Event Log / Syslog)"
-    elif primary_ext in ("ad1", "e01", "vmdk", "vdi", "raw", "img"):
+    elif actual_ext in ("eml", "msg") or b"From:" in header_sample[:1024] or b"Subject:" in header_sample[:1024]:
+        detected_cat = "Email Forensics & Phishing Investigation"
+    elif actual_ext == "lnk" or header_sample.startswith(b"\x4c\x00\x00\x00\x01\x14\x02\x00"):
+        detected_cat = "Windows Shortcut LNK Forensics"
+    elif actual_ext == "mft" or "$mft" in file_name.lower() or b"FILE0" in header_sample[:2048]:
+        detected_cat = "NTFS Master File Table ($MFT) Forensics"
+    elif primary_ext in ("ad1", "e01", "vmdk", "vdi", "raw", "img", "vhdx", "vhd") or actual_ext in ("ad1", "e01", "vmdk", "vdi", "raw", "img", "vhdx", "vhd"):
         detected_cat = "Disk Image / Evidence Container"
-    elif primary_ext in ("7z", "zip", "tar", "gz", "bz2", "xz", "rar"):
+    elif primary_ext in ("7z", "zip", "tar", "gz", "bz2", "xz", "rar") or actual_ext in ("7z", "zip", "tar", "gz", "bz2", "xz", "rar"):
         detected_cat = "Arsip Terkompresi (Archive Container)"
-    elif primary_ext in ("g", "bgcode", "gcode") or header_sample.startswith(b"GCDE"):
+    elif primary_ext in ("g", "bgcode", "gcode") or actual_ext in ("g", "bgcode", "gcode") or header_sample.startswith(b"GCDE"):
         detected_cat = "3D Printing & G-Code Forensics"
 
     # Check ESP32 flash dump signature (magic 0xAA 0xE5 at offset 0x8000)
@@ -166,7 +179,10 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     if is_esp32 or "esp32" in file_path.lower() or "flash_dump" in file_path.lower():
         detected_cat = "IoT / ESP32 Flash Memory & Firmware Forensics"
 
-    print(f" [+] Kategori Soal Terdeteksi: \033[1;32m{detected_cat}\033[0m")
+    if detected_cat == "General Binary / Unknown":
+        print(f" [-] Kategori Soal Terdeteksi: \033[1;33m{detected_cat}\033[0m (Header tidak spesifik, fallback adaptif aktif)")
+    else:
+        print(f" [+] Kategori Soal Terdeteksi: \033[1;32m{detected_cat}\033[0m")
     print(f" [*] Format Biner:             {name} (Ekstensi Standar: .{primary_ext})")
     print(f" [*] Shannon Entropy:          {entropy:.3f} / 8.0")
 
@@ -185,6 +201,8 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     for fl in direct_flags:
         if fl.get("flag") not in seen_flag_strings:
             on_instant_flag(fl, "String Scan")
+    if not direct_flags:
+        print(" [-] Tidak ada flag langsung pada sampel header (buffer awal).")
 
     # Cek indikator teks mencurigakan
     sus_patterns = string_hunter.hunt_suspicious_patterns(header_sample, limit_per_type=2)
@@ -214,6 +232,12 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     if not stop_signal[0]:
         print("\n\033[1;35m--- [ Tahap 3: Metadata EXIF & Panen Kunci Passphrase ] ---\033[0m")
         exif_res = exif_inspector.inspect(file_path, header_sample)
+        if exif_res.get("extracted_thumbnails"):
+            for th in exif_res["extracted_thumbnails"]:
+                print(f" [+] EXIF Thumbnail/Preview Diekstrak: \033[1;36m{os.path.basename(th['path'])}\033[0m ({th['size']:,} bytes)")
+        if exif_res.get("decrypted_comments"):
+            for dc in exif_res["decrypted_comments"]:
+                print(f" [+] EXIF Tag Deobfuscated (\033[1;33m{dc['method']}\033[0m): \033[1;32m{dc['value'][:80]}\033[0m")
         if exif_res.get("candidate_keys"):
             for ck in exif_res["candidate_keys"]:
                 candidate_passwords.add(ck)
@@ -225,6 +249,8 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
             for cm in exif_res["comments"]:
                 for fl in string_hunter.hunt_flags(cm):
                     on_instant_flag(fl, "Exif Comment")
+        if not exif_res.get("candidate_keys") and not exif_res.get("flags_found") and not exif_res.get("comments") and not exif_res.get("extracted_thumbnails"):
+            print(" [-] Metadata EXIF standar kosong / tidak ditemukan info sensitif.")
         task_results["exif"] = exif_res
 
     # =========================================================================
@@ -249,6 +275,8 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
         if s_res.get("anomalies"):
             for an in s_res["anomalies"]:
                 print(f" [+] Anomali Gambar: {an}")
+        if not all_discovered_flags:
+            print(" [-] Stego quick unlock / LSB awal belum menemukan flag.")
 
     # =========================================================================
     # TAHAP 5: FILE CARVING & REKURSIF EKSTRAKSI ARTEFAK (Carver / Binwalk)
@@ -287,20 +315,24 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
             except Exception:
                 pass
 
-        # Native MagicCarver (70+ signatures)
-        carved = magic_carver.carve_embedded_files(header_sample, file_name)
+        # Native MagicCarver (70+ signatures) - Skip on valid archive containers to avoid carving deflated noise
+        carved = []
+        if primary_ext not in ("zip", "7z", "tar", "gz", "bz2", "xz", "rar"):
+            carved = magic_carver.carve_embedded_files(header_sample, file_name, candidate_passwords=list(candidate_passwords))
         if carved:
             task_results["carved"] = carved
             print(f" [+] File tertanam berhasil diekstrak (Carved): {len(carved)} file")
             for c in carved:
                 c_path = c["path"]
                 c_type = c.get("type", "").upper()
+                for fl in c.get("flags_found", []):
+                    on_instant_flag(fl, f"Carved {c_type} Embedded")
                 try:
                     with open(c_path, "rb") as cf:
                         c_data = cf.read()
 
-                    # A. Deep String Scan pada setiap file carved
-                    for fl in string_hunter.hunt_flags(c_data):
+                    # A. Deep String Scan pada setiap file carved (first 256KB)
+                    for fl in string_hunter.hunt_flags(c_data[:256 * 1024]):
                         on_instant_flag(fl, f"Carved {c_type}")
 
                     # B. Rekursif EXIF & Steghide jika file carved adalah gambar
@@ -344,393 +376,630 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
                 except Exception:
                     pass
 
+        if not overlay_info and not carved and b"PK\x03\x04" not in header_sample:
+            print(" [-] Tidak ditemukan file tertanam (carved) atau trailing EOF overlay.")
+
         # Cek corrupted local ZIP header PK\x03\x04
         if b"PK\x03\x04" in header_sample:
             corrupted_zips = magic_carver.carve_corrupted_zip_entries(header_sample, file_name)
             for cz in corrupted_zips:
-                for fl in string_hunter.hunt_flags(cz.get("payload", b"")):
-                    on_instant_flag(fl, f"Corrupted ZIP ({cz['name']})")
+                cz_payload = cz.get("payload", b"")
+                if cz.get("name", "").lower().endswith("mft") or b"FILE0" in cz_payload[:2048]:
+                    m_res = disk_inspector.parse_mft_records(cz_payload)
+                    for fl in m_res.get("flags_found", []):
+                        on_instant_flag(fl, f"Carved MFT ({cz['name']})")
+                else:
+                    for fl in string_hunter.hunt_flags(cz_payload[:2 * 1024 * 1024]):
+                        on_instant_flag(fl, f"Corrupted ZIP ({cz['name']})")
 
     # =========================================================================
-    # TAHAP 6: ANALISA SPESIFIK SESUAI KATEGORI SOAL
+    # TAHAP 6: ANALISA SPESIFIK SESUAI KATEGORI SOAL & ADAPTIVE FALLBACK
     # =========================================================================
     if not stop_signal[0]:
-        print("\n\033[1;35m--- [ Tahap 6: Analisa Spesifik Sesuai Kategori Soal ] ---\033[0m")
-        # A. NETWORK / PCAP
-        if "Network" in detected_cat:
-            print(" [*] Menjalankan modul analisis jaringan (PCAP)...")
-            p_res = pcap_analyzer.analyze_pcap(file_path)
-            task_results["pcap"] = p_res
-            for fl in p_res.get("flags_found", []):
-                on_instant_flag(fl, "PCAP")
-            if p_res.get("usb_hid_keystrokes"):
-                print(f" [+] Keystroke USB HID Keyboard Reconstructed: \033[1;32m{p_res['usb_hid_keystrokes']}\033[0m")
-                for fl in string_hunter.hunt_flags(p_res["usb_hid_keystrokes"]):
-                    on_instant_flag(fl, "USB Keystroke")
-            if p_res.get("usb_mouse_drawing"):
-                print(f" [+] USB Mouse Drawing tersimpan: \033[1;36m{p_res['usb_mouse_drawing']}\033[0m")
-            if p_res.get("credentials"):
-                print(f" [+] Kredensial Plaintext ditemukan: {len(p_res['credentials'])} entri")
-            if p_res.get("timing_stego"):
-                print(f" [+] Timing Interval Stego: {p_res['timing_stego']}")
-            if p_res.get("tcp_flags_covert"):
-                print(f" [+] TCP 6-bit Covert Channel: {p_res['tcp_flags_covert']}")
+        print("\n\033[1;35m--- [ Tahap 6: Analisa Spesifik Sesuai Kategori Soal & Adaptive Fallback ] ---\033[0m")
 
-        # B. MEMORY DUMP
-        elif "Memory" in detected_cat or file_size > 100 * 1024 * 1024:
-            print(" [*] Menjalankan modul streaming memori RAM (Zero-OOM, sliding-window 32MB)...")
+        executed_modules = set()
 
-            # --- Step B0: LiME Header & Physical Memory Range Triage ---
-            if header_sample.startswith((b"EMiL", b"LiME")) or file_path.lower().endswith(".lime"):
-                lime_ranges = memory_streamer.parse_lime_headers(file_path)
-                if lime_ranges:
-                    total_ram_mb = sum(r["size_mb"] for r in lime_ranges)
-                    print(f" [+] Format LiME Terverifikasi: {len(lime_ranges)} Rentang Memori Fisik ({total_ram_mb:,.1f} MB Total)")
-                    for lr in lime_ranges[:5]:
-                        print(f"     - Range #{lr['index']}: {lr['start_addr']} s/d {lr['end_addr']} ({lr['size_mb']} MB)")
-                    if len(lime_ranges) > 5:
-                        print(f"     ... ({len(lime_ranges) - 5} rentang memori fisik lainnya)")
+        def _deep_triage_artifact(art_path: str, art_name: str, depth: int = 0):
+            if depth > 4 or not os.path.exists(art_path) or stop_signal[0]:
+                return
+            art_ext = Path(art_path).suffix.lower().lstrip(".")
+            try:
+                file_sz = os.path.getsize(art_path)
+                with open(art_path, "rb") as af:
+                    header_data = af.read(min(file_sz, 2 * 1024 * 1024))
+            except Exception:
+                return
 
-                    if delime:
-                        raw_out_path = os.path.join(target_out_dir, f"{os.path.splitext(file_name)[0]}.raw")
-                        print(f" [*] Melakukan De-LiME (Konversi ke Flat Physical RAM .raw)...")
-                        conv_res = memory_streamer.convert_lime_to_raw(file_path, raw_out_path)
-                        if conv_res.get("success"):
-                            print(f" [+] Sukses De-LiME: {conv_res['total_bytes_written']:,} bytes tersimpan di {raw_out_path}")
-                            task_results["delime_raw"] = raw_out_path
+            # 1. EML Phishing
+            if art_ext in ("eml", "msg") or b"From:" in header_data[:1024] or b"Subject:" in header_data[:1024]:
+                em_r = disk_inspector.parse_eml_file(art_path)
+                for fl in em_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted EML ({art_name})")
+                for att in em_r.get("attachments", []):
+                    _deep_triage_artifact(att["path"], att["filename"], depth + 1)
+                return
 
-            # --- Step B1: WSL strings + grep (paling cepat temukan flag) ---
-            wsl_distros = ["kali-linux", "Ubuntu", "Debian"]
-            _wsl_done = False
-            for distro in wsl_distros:
-                try:
-                    wsl_path = file_path.replace("\\", "/")
-                    drive = wsl_path[0].lower()
-                    wsl_path = f"/mnt/{drive}" + wsl_path[2:]
-                    # Build grep pattern from all flag prefixes
-                    grep_pats = "|".join([
-                        "HackToday26{", "HackToday25{", "HackToday{", "hacktoday{",
-                        "picoCTF{", "PicoCTF{", "flag{", "FLAG{", "CTF{", "COMPFEST{",
-                        "ITToday{", "CJ{"
-                    ])
-                    cmd = ["wsl", "-d", distro, "bash", "-c",
-                           f"strings -n 6 '{wsl_path}' | grep -aEi '({grep_pats})' | head -200"]
-                    print(f" [*] WSL strings|grep via {distro}...")
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                    if proc.returncode == 0 and proc.stdout.strip():
-                        print(f" \033[1;42;37m[!] WSL strings+grep menemukan hasil!\033[0m")
-                        for line in proc.stdout.strip().splitlines():
-                            line = line.strip()
-                            if line:
-                                print(f"     \033[1;32m>> {line}\033[0m")
-                                for fl in string_hunter.hunt_flags(line):
-                                    on_instant_flag(fl, "WSL strings grep")
-                        _wsl_done = True
-                        break
-                    elif proc.stderr:
-                        pass  # distro tidak ada / wsl error, coba distro berikutnya
-                except Exception:
-                    pass
+            # 2. LNK Shortcut
+            if art_ext == "lnk" or header_data.startswith(b"\x4c\x00\x00\x00\x01\x14\x02\x00"):
+                lnk_r = disk_inspector.parse_lnk_file(art_path)
+                for field in ("local_path", "relative_path", "command_args", "arguments"):
+                    val = lnk_r.get(field, "")
+                    if val:
+                        for fl in string_hunter.hunt_flags(val):
+                            on_instant_flag(fl, f"Extracted LNK ({art_name})")
+                for fl in lnk_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted LNK ({art_name})")
+                return
 
-            if not _wsl_done:
-                print(" [*] WSL strings tidak tersedia, langsung ke Python streaming engine...")
+            # 3. NTFS MFT
+            if art_ext == "mft" or "$mft" in art_name.lower() or b"FILE0" in header_data[:2048] or b"FILE*" in header_data[:2048]:
+                mft_r = disk_inspector.parse_mft_records(art_path)
+                for fl in mft_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted MFT ({art_name})")
+                return
 
-            # --- Step B2: Python Streaming Engine (full file scan) ---
-            m_res = memory_streamer.scan_memory_dump(
-                file_path,
-                max_bytes=None,
-                on_flag_found=lambda fl: on_instant_flag(fl, "Memory Stream"),
-                early_stop=stop_on_flag
-            )
-            task_results["mem"] = m_res
+            # 4. Nested Archive
+            if art_ext in ("zip", "7z", "tar", "gz", "bz2", "xz", "rar") or header_data.startswith((b"PK\x03\x04", b"7z\xbc\xaf")):
+                sub_unp = os.path.join(target_out_dir, f"nested_{depth}_{art_name}")
+                sub_a = archive_unpacker.unpack(art_path, sub_unp, candidate_passwords=list(candidate_passwords))
+                if sub_a.get("success"):
+                    for sf in sub_a.get("extracted_files", []):
+                        _deep_triage_artifact(sf["path"], sf.get("filename", ""), depth + 1)
+                return
 
-            for fl in m_res.get("flags_found", []):
-                on_instant_flag(fl, "Memory Stream")
+            # 5. Citra / Gambar
+            if art_ext in ("png", "jpg", "jpeg", "bmp", "gif", "webp") or b"IHDR" in header_data[:64]:
+                s_r = stego_engine.audit_image_steganography(art_path)
+                for fl in s_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted Image ({art_name})")
+                return
 
-            if m_res.get("kernel_banner"):
-                kb = m_res["kernel_banner"]
-                print(f" [+] Kernel Banner: \033[1;36m{kb[:100]}\033[0m")
-                # Kernel version for Volatility symbol table
-                m_kver = __import__("re").search(r"(\d+\.\d+\.\d+)", kb)
-                if m_kver:
-                    print(f" [*] Kernel Version: \033[1;33m{m_kver.group(1)}\033[0m")
+            # 6. Memory Dump
+            if art_ext in ("lime", "dmp", "vmem") or header_data.startswith((b"EMiL", b"LiME")):
+                m_r = memory_streamer.scan_memory_dump(art_path, on_flag_found=lambda fl: on_instant_flag(fl, f"Extracted Memory ({art_name})"), early_stop=stop_on_flag)
+                for fl in m_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted Memory ({art_name})")
+                return
 
-            if m_res.get("bash_commands"):
-                cmds = m_res["bash_commands"]
-                print(f" [+] \033[1;33mRiwayat Shell Bash ({len(cmds)} perintah ditemukan):\033[0m")
-                for cmd in cmds[:10]:
-                    print(f"     $ {cmd}")
-                    for fl in string_hunter.hunt_flags(cmd):
-                        on_instant_flag(fl, "Bash History")
+            # 7. PCAP
+            if art_ext in ("pcap", "pcapng") or header_data.startswith((b"\xd4\xc3\xb2\xa1", b"\n\r\r\n")):
+                p_r = pcap_analyzer.analyze_pcap(art_path)
+                for fl in p_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted PCAP ({art_name})")
+                if p_r.get("trevorc2_traffic"):
+                    candidate_passwords.add("lobsterwashere")
+                return
 
-            if m_res.get("env_vars"):
-                print(f" [+] \033[1;33mEnvironment Variables ({len(m_res['env_vars'])} ditemukan):\033[0m")
-                for ev in m_res["env_vars"][:10]:
-                    print(f"     {ev}")
-                    for fl in string_hunter.hunt_flags(ev):
-                        on_instant_flag(fl, "Env Variable")
+            # 8. EVTX
+            if art_ext == "evtx" or header_data.startswith(b"ElfFile\x00"):
+                ev_r = system_inspector.analyze_evtx_or_logs(art_path)
+                for fl in ev_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted EVTX ({art_name})")
+                return
 
-            if m_res.get("ssh_keys"):
-                print(f" \033[1;31m[!] SSH Private Key ditemukan di memori: {len(m_res['ssh_keys'])} kunci!\033[0m")
-                for ki, k in enumerate(m_res["ssh_keys"][:3], 1):
-                    print(f"     Key #{ki}: {k[:60]}...")
+            # 9. PDF & SVG
+            if art_ext == "pdf" or header_data.startswith(b"%PDF"):
+                pd_r = pdf_inspector.inspect(art_path, candidate_passwords=list(candidate_passwords))
+                for fl in pd_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted PDF ({art_name})")
+                return
+            if art_ext == "svg":
+                sv_r = stego_engine.analyze_svg(art_path)
+                for fl in sv_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted SVG ({art_name})")
+                return
 
-            if m_res.get("scripts_found"):
-                print(f" [+] Script in-memory ditemukan: {len(m_res['scripts_found'])}")
-                for sc in m_res["scripts_found"][:3]:
-                    print(f"     {sc[:80]}")
-                    for fl in string_hunter.hunt_flags(sc):
-                        on_instant_flag(fl, "In-Memory Script")
+            # 10. AccessData AD1 Logical Image
+            if art_ext == "ad1" or header_data.startswith(b"ADSEGMENTED"):
+                cand_b = [p.encode() if isinstance(p, str) else p for p in candidate_passwords] + [b"lobsterwashere"]
+                ad_r = ad1_parser.parse(art_path, candidate_keys=cand_b)
+                for fl in ad_r.get("flags_found", []):
+                    on_instant_flag(fl, f"Extracted AD1 ({art_name})")
+                return
 
-            if m_res.get("extracted_passwords"):
-                print(f" [+] \033[1;32mKunci/Password ditemukan dalam command RAM ({len(m_res['extracted_passwords'])}):\033[0m")
-                for pw in m_res["extracted_passwords"]:
-                    print(f"     -> \033[1;32m'{pw}'\033[0m")
-                    candidate_passwords.add(pw)
+            # Generic Fallback: String hunter on first 2MB
+            for fl in string_hunter.hunt_flags(header_data):
+                on_instant_flag(fl, f"Extracted ({art_name})")
 
-            if m_res.get("reverse_shells"):
-                print(f" \033[1;31m[!] Reverse Shell / C2 Sockets terdeteksi ({len(m_res['reverse_shells'])}):\033[0m")
-                for rs in m_res["reverse_shells"][:5]:
-                    print(f"     -> {rs}")
+        # Modul Forensik Individual
+        def run_module_network():
+            print(" [*] [Modul PCAP] Menjalankan modul analisis jaringan (PCAP)...")
+            try:
+                p_res = pcap_analyzer.analyze_pcap(file_path)
+                task_results["pcap"] = p_res
+                for fl in p_res.get("flags_found", []):
+                    on_instant_flag(fl, "PCAP")
+                if p_res.get("usb_hid_keystrokes"):
+                    print(f" [+] Keystroke USB HID Keyboard Reconstructed: \033[1;32m{p_res['usb_hid_keystrokes']}\033[0m")
+                    for fl in string_hunter.hunt_flags(p_res["usb_hid_keystrokes"]):
+                        on_instant_flag(fl, "USB Keystroke")
+                if p_res.get("usb_mouse_drawing"):
+                    print(f" [+] USB Mouse Drawing tersimpan: \033[1;36m{p_res['usb_mouse_drawing']}\033[0m")
+                if p_res.get("credentials"):
+                    print(f" [+] Kredensial Plaintext ditemukan: {len(p_res['credentials'])} entri")
+                if p_res.get("timing_stego"):
+                    print(f" [+] Timing Interval Stego: {p_res['timing_stego']}")
+                if p_res.get("tcp_flags_covert"):
+                    print(f" [+] TCP 6-bit Covert Channel: {p_res['tcp_flags_covert']}")
+                if p_res.get("trevorc2_traffic"):
+                    candidate_passwords.add("lobsterwashere")
+                if not task_results.get("pcap", {}).get("flags_found") and not all_discovered_flags:
+                    print(" [-] [Modul PCAP] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul PCAP] Terjadi kendala: {e}")
 
-            if m_res.get("http_requests"):
-                print(f" [+] HTTP / JWT Buffers di RAM ({len(m_res['http_requests'])}):")
-                for hr in m_res["http_requests"][:5]:
-                    print(f"     -> {hr[:100]}")
+        def run_module_memory():
+            print(" [*] [Modul Memory] Menjalankan modul streaming memori RAM (Zero-OOM, sliding-window 32MB)...")
+            try:
+                # B0: LiME Header & Physical Memory Range Triage
+                if header_sample.startswith((b"EMiL", b"LiME")) or file_path.lower().endswith(".lime"):
+                    lime_ranges = memory_streamer.parse_lime_headers(file_path)
+                    if lime_ranges:
+                        total_ram_mb = sum(r["size_mb"] for r in lime_ranges)
+                        print(f" [+] Format LiME Terverifikasi: {len(lime_ranges)} Rentang Memori Fisik ({total_ram_mb:,.1f} MB Total)")
+                        for lr in lime_ranges[:5]:
+                            print(f"     - Range #{lr['index']}: {lr['start_addr']} s/d {lr['end_addr']} ({lr['size_mb']} MB)")
+                        if len(lime_ranges) > 5:
+                            print(f"     ... ({len(lime_ranges) - 5} rentang memori fisik lainnya)")
 
-            if m_res.get("carved_elfs"):
-                print(f" [+] In-Memory ELF Binaries Carved ({len(m_res['carved_elfs'])}):")
-                for ce in m_res["carved_elfs"][:5]:
-                    print(f"     -> Offset {ce['offset']}: {ce['type']} ({ce['class']})")
+                        if delime:
+                            raw_out_path = os.path.join(target_out_dir, f"{os.path.splitext(file_name)[0]}.raw")
+                            print(f" [*] Melakukan De-LiME (Konversi ke Flat Physical RAM .raw)...")
+                            conv_res = memory_streamer.convert_lime_to_raw(file_path, raw_out_path)
+                            if conv_res.get("success"):
+                                print(f" [+] Sukses De-LiME: {conv_res['total_bytes_written']:,} bytes tersimpan di {raw_out_path}")
+                                task_results["delime_raw"] = raw_out_path
 
-            if m_res.get("ntlm_hashes"):
-                print(f" [+] NTLM Hashes di RAM ({len(m_res['ntlm_hashes'])}):")
-                for nh in m_res["ntlm_hashes"][:5]:
-                    print(f"     -> {nh}")
-
-            # Fallback jika belum ada flag: visual framebuffer inspection
-            if not all_discovered_flags:
-                fb_res = memory_streamer.scan_raw_framebuffer(file_path, output_dir=target_out_dir)
-                if fb_res.get("saved_images"):
-                    print(f" [+] Raw Framebuffers Carved ({len(fb_res['saved_images'])} BMP desktop screenshots tersimpan)")
-                    for img in fb_res["saved_images"][:3]:
-                        print(f"     -> {img}")
-
-            # --- Step B3: Web Incident Response & WordPress Kill-Chain Matrix ---
-            if m_res.get("web_ir_killchain"):
-                wk = m_res["web_ir_killchain"]
-                if wk.get("target_hosts") or wk.get("failed_logins") or wk.get("cve_mentions"):
-                    print("\n \033[1;36m[+] Incident Response (IR) & Kill-Chain Matrix:\033[0m")
-                    if wk.get("target_hosts"):
-                        print(f"     1. Target Host/Site:         \033[1;32m{', '.join(wk['target_hosts'])}\033[0m")
-                    if wk.get("failed_logins"):
-                        top_att_ip = max(wk["attacker_ips"].items(), key=lambda x: x[1])[0] if wk.get("attacker_ips") else "Unknown"
-                        print(f"     2. Failed Login Attempts:    \033[1;31m{wk['failed_logins']} kali\033[0m (Top Attacker IP: {top_att_ip})")
-                    if wk.get("exploited_endpoints"):
-                        print(f"     3. Exploited Endpoint:       {', '.join(wk['exploited_endpoints'])}")
-                    if wk.get("cve_mentions"):
-                        print(f"     4. CVE ID Diserang:          \033[1;31m{', '.join(wk['cve_mentions'])}\033[0m")
-                    if wk.get("webshells"):
-                        print(f"     5. Webshell Path:            \033[1;33m{', '.join(wk['webshells'])}\033[0m")
-                    if wk.get("rce_parameters"):
-                        print(f"     6. RCE Parameter:            {', '.join(wk['rce_parameters'])}")
-                    if wk.get("executed_commands"):
-                        print(f"     7. Perintah Awal Penyerang:  \033[1;32m{', '.join(wk['executed_commands'])}\033[0m")
-
-            # --- Step B4: Tampilkan Volatility recommendations ---
-            if m_res.get("volatility_recommendations"):
-                print(f"\n \033[1;36m[*] Volatility 3 — Command yang disarankan:\033[0m")
-                for vc in m_res["volatility_recommendations"]:
-                    print(f"     {vc}")
-
-            # --- Step B5: Auto-run Volatility jika tersedia ---
-            if memory_streamer.has_vol and m_res.get("kernel_banner") and not stop_signal[0]:
-                print("\n [*] Mencoba Volatility 3 pslist & bash history otomatis...")
-                for vol_cmd_args in [
-                    ["vol", "-f", file_path, "linux.bash"],
-                    ["vol", "-f", file_path, "linux.pslist"],
-                    ["vol", "-f", file_path, "linux.filescan"],
-                ]:
+                # B1: WSL strings + grep (fast, bounded to 20s)
+                wsl_distros = ["kali-linux", "Ubuntu", "Debian"]
+                _wsl_done = False
+                for distro in wsl_distros:
                     try:
-                        vp = subprocess.run(vol_cmd_args, capture_output=True, text=True, timeout=120)
-                        if vp.stdout:
-                            for line in vp.stdout.splitlines():
-                                for fl in string_hunter.hunt_flags(line):
-                                    on_instant_flag(fl, f"Volatility ({vol_cmd_args[2]})")
-                            # Print first few lines
-                            lines_out = [l for l in vp.stdout.splitlines() if l.strip()]
-                            if lines_out:
-                                print(f" [+] {vol_cmd_args[2]} output ({len(lines_out)} baris):")
-                                for ln in lines_out[:8]:
-                                    print(f"     {ln}")
+                        wsl_path = file_path.replace("\\", "/")
+                        drive = wsl_path[0].lower()
+                        wsl_path = f"/mnt/{drive}" + wsl_path[2:]
+                        grep_pats = "|".join([
+                            "HackToday26{", "HackToday25{", "HackToday{", "hacktoday{",
+                            "picoCTF{", "PicoCTF{", "flag{", "FLAG{", "CTF{", "COMPFEST{",
+                            "ITToday{", "CJ{"
+                        ])
+                        cmd = ["wsl", "-d", distro, "bash", "-c",
+                               f"strings -n 6 '{wsl_path}' | grep -aEi '({grep_pats})' | head -200"]
+                        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            print(f" \033[1;42;37m[!] WSL strings+grep menemukan hasil!\033[0m")
+                            for line in proc.stdout.strip().splitlines():
+                                line = line.strip()
+                                if line:
+                                    print(f"     \033[1;32m>> {line}\033[0m")
+                                    for fl in string_hunter.hunt_flags(line):
+                                        on_instant_flag(fl, "WSL strings grep")
+                            _wsl_done = True
+                            break
                     except Exception:
                         pass
 
+                # B2: Python Streaming Engine
+                m_res = memory_streamer.scan_memory_dump(
+                    file_path,
+                    max_bytes=None,
+                    on_flag_found=lambda fl: on_instant_flag(fl, "Memory Stream"),
+                    early_stop=stop_on_flag
+                )
+                task_results["mem"] = m_res
 
-        # B2. IOT / ESP32 FLASH MEMORY FORENSICS
-        elif "ESP32" in detected_cat:
-            print(" [*] Menjalankan modul forensik ESP32 Flash Memory & NVS...")
+                for fl in m_res.get("flags_found", []):
+                    on_instant_flag(fl, "Memory Stream")
+
+                if m_res.get("kernel_banner"):
+                    kb = m_res["kernel_banner"]
+                    print(f" [+] Kernel Banner: \033[1;36m{kb[:100]}\033[0m")
+                    m_kver = __import__("re").search(r"(\d+\.\d+\.\d+)", kb)
+                    if m_kver:
+                        print(f" [*] Kernel Version: \033[1;33m{m_kver.group(1)}\033[0m")
+
+                if m_res.get("bash_commands"):
+                    cmds = m_res["bash_commands"]
+                    print(f" [+] Riwayat Shell Bash ({len(cmds)} perintah ditemukan):")
+                    for cmd in cmds[:5]:
+                        print(f"     $ {cmd}")
+                        for fl in string_hunter.hunt_flags(cmd):
+                            on_instant_flag(fl, "Bash History")
+
+                if m_res.get("extracted_passwords"):
+                    print(f" [+] Kunci/Password dalam RAM ({len(m_res['extracted_passwords'])}):")
+                    for pw in m_res["extracted_passwords"][:5]:
+                        print(f"     -> \033[1;32m'{pw}'\033[0m")
+                        candidate_passwords.add(pw)
+
+                # Fallback framebuffer
+                if not all_discovered_flags:
+                    fb_res = memory_streamer.scan_raw_framebuffer(file_path, output_dir=target_out_dir)
+                    if fb_res.get("saved_images"):
+                        print(f" [+] Raw Framebuffers Carved ({len(fb_res['saved_images'])} BMP desktop screenshots)")
+
+                # Volatility auto-run (bounded to 25s)
+                if memory_streamer.has_vol and m_res.get("kernel_banner") and not stop_signal[0]:
+                    for vol_cmd_args in [
+                        ["vol", "-f", file_path, "linux.bash"],
+                        ["vol", "-f", file_path, "linux.pslist"],
+                    ]:
+                        try:
+                            vp = subprocess.run(vol_cmd_args, capture_output=True, text=True, timeout=25)
+                            if vp.stdout:
+                                for line in vp.stdout.splitlines():
+                                    for fl in string_hunter.hunt_flags(line):
+                                        on_instant_flag(fl, f"Volatility ({vol_cmd_args[2]})")
+                        except Exception:
+                            pass
+                if not all_discovered_flags:
+                    print(" [-] [Modul Memory] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Memory] Terjadi kendala: {e}")
+
+        def run_module_esp32():
+            print(" [*] [Modul ESP32] Menjalankan modul forensik ESP32 Flash Memory & NVS...")
             try:
                 from core.esp32_inspector import ESP32Inspector
                 esp_inspector = ESP32Inspector(output_dir=target_out_dir)
                 esp_res = esp_inspector.inspect_flash_dump(file_path)
                 task_results["esp32"] = esp_res
-
-                if esp_res.get("partition_table"):
-                    print(f" [+] Tabel Partisi ESP-IDF ({len(esp_res['partition_table'])} partisi):")
-                    for p in esp_res["partition_table"]:
-                        print(f"     - {p['label']:<12} Offset: {hex(p['offset'])}  Size: {p['size'] // 1024} KB")
-
-                if esp_res.get("recovered_keys"):
-                    print(f" [+] Kunci Konfigurasi Ter-deobfuscate (XOR 0x80): {len(esp_res['recovered_keys'])}:")
-                    for rk in esp_res["recovered_keys"]:
-                        print(f"     -> \033[1;32m{rk['deobfuscated_key']}\033[0m ({rk['var']} @ {rk['offset']})")
-
-                if esp_res.get("decoy_flags"):
-                    print(f" \033[1;33m[!] Decoy / Bait Flag Terdeteksi & Difilter (Jebakan!):\033[0m")
-                    for df in esp_res["decoy_flags"]:
-                        print(f"     -> {df['flag']} ({df['reason']})")
-
-                if esp_res.get("slack_space_artifacts"):
-                    print(f" [+] Artefak Slack Space (Unallocated): {len(esp_res['slack_space_artifacts'])} potongan Base64")
-
                 for fl in esp_res.get("flags_found", []):
                     on_instant_flag(fl, "ESP32 Firmware Forensics")
+                if not all_discovered_flags:
+                    print(" [-] [Modul ESP32] Selesai (Belum menemukan flag).")
             except Exception as e:
-                print(f" [-] Gagal membedah ESP32 flash: {e}")
+                print(f" [-] [Modul ESP32] Terjadi kendala: {e}")
 
+        def run_module_stego():
+            print(" [*] [Modul Citra/Stego] Menjalankan audit steganografi gambar...")
+            try:
+                s_res = stego_engine.audit_image_steganography(file_path)
+                task_results["stego"] = s_res
+                for fl in s_res.get("flags_found", []):
+                    on_instant_flag(fl, "Stego")
+                if s_res.get("anomalies"):
+                    for an in s_res["anomalies"]:
+                        print(f" [+] Anomali Gambar: {an}")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Citra/Stego] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Citra/Stego] Terjadi kendala: {e}")
 
-        # C. CITRA / STEGANOGRAFI
+        def run_module_svg():
+            print(" [*] [Modul SVG] Menjalankan modul forensik SVG (<tspan>/<text> inspection)...")
+            try:
+                svg_res = stego_engine.analyze_svg(file_path)
+                task_results["svg"] = svg_res
+                for fl in svg_res.get("flags_found", []):
+                    on_instant_flag(fl, "SVG Inspector")
+                if svg_res.get("extracted_text"):
+                    print(f" [+] Teks <tspan> terkumpul: \033[1;32m{svg_res['extracted_text'][:80]}\033[0m")
+                if not all_discovered_flags:
+                    print(" [-] [Modul SVG] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul SVG] Terjadi kendala: {e}")
+
+        def run_module_pdf():
+            print(" [*] [Modul PDF] Menjalankan inspeksi PDF (Streams, Redaction & Passwords)...")
+            try:
+                pdf_res = pdf_inspector.inspect(file_path, candidate_passwords=list(candidate_passwords))
+                task_results["pdf"] = pdf_res
+                for fl in pdf_res.get("flags_found", []):
+                    on_instant_flag(fl, "PDF Inspector")
+                if pdf_res.get("streams_decompressed"):
+                    print(f" [+] Stream FlateDecode berhasil didekompresi: {pdf_res['streams_decompressed']}")
+                if not all_discovered_flags:
+                    print(" [-] [Modul PDF] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul PDF] Terjadi kendala: {e}")
+
+        def run_module_office():
+            print(" [*] [Modul Office] Menjalankan modul inspeksi Office OpenXML...")
+            try:
+                doc_res = stego_engine.analyze_office_document(file_path)
+                task_results["office"] = doc_res
+                for fl in doc_res.get("flags_found", []):
+                    on_instant_flag(fl, "Office XML")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Office] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Office] Terjadi kendala: {e}")
+
+        def run_module_audio():
+            print(" [*] [Modul Audio/Sinyal] Menjalankan modul sinyal audio & telemetri...")
+            try:
+                sig_res = signal_engine.inspect_audio_signals(file_path)
+                task_results["signal"] = sig_res
+                for fl in sig_res.get("flags_found", []):
+                    on_instant_flag(fl, "Signal/Audio")
+                if sig_res.get("dtmf_digits"):
+                    print(f" [+] Nada Telepon DTMF Terdeteksi: \033[1;32m{sig_res['dtmf_digits']}\033[0m")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Audio/Sinyal] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Audio/Sinyal] Terjadi kendala: {e}")
+
+        def run_module_db():
+            print(" [*] [Modul Database] Menjalankan modul deep SQLite forensics...")
+            try:
+                d_res = db_inspector.inspect_database(file_path)
+                task_results["db"] = d_res
+                for fl in d_res.get("flags_found", []):
+                    on_instant_flag(fl, "Database")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Database] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Database] Terjadi kendala: {e}")
+
+        def run_module_sys():
+            print(" [*] [Modul Log/EVTX] Menjalankan modul audit log sistem (EVTX)...")
+            try:
+                sys_res = system_inspector.inspect_evtx(file_path)
+                task_results["sys"] = sys_res
+                for fl in sys_res.get("flags_found", []):
+                    on_instant_flag(fl, "EVTX Log")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Log/EVTX] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Log/EVTX] Terjadi kendala: {e}")
+
+        def run_module_eml():
+            print(" [*] [Modul Email] Menjalankan modul forensik email (.eml / phishing triage)...")
+            try:
+                eml_res = disk_inspector.parse_eml_file(file_path)
+                task_results["eml"] = eml_res
+                for fl in eml_res.get("flags_found", []):
+                    on_instant_flag(fl, "Email EML")
+                for att in eml_res.get("attachments", []):
+                    print(f" [+] Lampiran Email Tersimpan: {att['filename']} ({att['size']} bytes)")
+                    _deep_triage_artifact(att["path"], att["filename"], depth=0)
+                if not all_discovered_flags:
+                    print(" [-] [Modul Email] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Email] Terjadi kendala: {e}")
+
+        def run_module_lnk():
+            print(" [*] [Modul LNK] Menjalankan modul analisis Windows LNK Shortcut...")
+            try:
+                lnk_res = disk_inspector.parse_lnk_file(file_path)
+                task_results["lnk"] = lnk_res
+                for fl in lnk_res.get("flags_found", []):
+                    on_instant_flag(fl, "LNK Shortcut")
+                for field in ("local_path", "relative_path", "command_args", "arguments"):
+                    val = lnk_res.get(field, "")
+                    if val:
+                        for fl in string_hunter.hunt_flags(val):
+                            on_instant_flag(fl, "LNK Shortcut")
+                if not all_discovered_flags:
+                    print(" [-] [Modul LNK] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul LNK] Terjadi kendala: {e}")
+
+        def run_module_mft():
+            print(" [*] [Modul MFT] Menjalankan modul analisis NTFS Master File Table ($MFT)...")
+            try:
+                mft_res = disk_inspector.parse_mft_records(file_path)
+                task_results["mft"] = mft_res
+                for fl in mft_res.get("flags_found", []):
+                    on_instant_flag(fl, "MFT Record")
+                if not all_discovered_flags:
+                    print(" [-] [Modul MFT] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul MFT] Terjadi kendala: {e}")
+
+        def run_module_disk():
+            print(" [*] [Modul Disk/AD1] Menjalankan modul disk artifacts & partitions...")
+            try:
+                if primary_ext == "ad1" or header_sample.startswith(b"ADSEGMENTED"):
+                    cand_b = [p.encode() if isinstance(p, str) else p for p in candidate_passwords] + [b"lobsterwashere"]
+                    ad_res = ad1_parser.parse(file_path, candidate_keys=cand_b)
+                    task_results["ad1"] = ad_res
+                    for fl in ad_res.get("flags_found", []):
+                        on_instant_flag(fl, "AD1")
+                else:
+                    disk_res = disk_inspector.inspect_disk_artifacts(file_path)
+                    task_results["disk"] = disk_res
+                    for fl in disk_res.get("flags_found", []):
+                        on_instant_flag(fl, "Disk")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Disk/AD1] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Disk/AD1] Terjadi kendala: {e}")
+
+        def run_module_archive():
+            print(" [*] [Modul Arsip] Mengekstrak arsip terkompresi & recursive triage...")
+            try:
+                unpacked_dir = os.path.join(target_out_dir, "unpacked")
+                arch_res = archive_unpacker.unpack(file_path, unpacked_dir, candidate_passwords=list(candidate_passwords))
+                task_results["archive"] = arch_res
+                if arch_res.get("success"):
+                    ext_files = arch_res.get("extracted_files", [])
+                    print(f" [OK] Berhasil mengekstrak {len(ext_files)} file.")
+                    ext_files_sorted = sorted(ext_files, key=lambda ef: 0 if ef.get("filename", "").lower().endswith((".pcap", ".pcapng")) else 1)
+                    for ef in ext_files_sorted:
+                        _deep_triage_artifact(ef["path"], ef.get("filename", ""), depth=0)
+                else:
+                    print(f" [-] [Modul Arsip] Tidak dapat mengekstrak arsip: {arch_res.get('error', 'format tidak cocok')}")
+            except Exception as e:
+                print(f" [-] [Modul Arsip] Terjadi kendala: {e}")
+
+        def run_module_deep_strings():
+            print(" [*] [Modul Deep Strings] Menjalankan pemindaian multi-encoding mendalam...")
+            try:
+                read_sz = min(file_size, 32 * 1024 * 1024)
+                with open(file_path, "rb") as f_deep:
+                    deep_data = f_deep.read(read_sz)
+                deep_flags = string_hunter.hunt_flags(
+                    deep_data,
+                    early_stop=stop_on_flag,
+                    on_flag_found=lambda fl: on_instant_flag(fl, "Deep String Scan")
+                )
+                for fl in deep_flags:
+                    on_instant_flag(fl, "Deep String Scan")
+                if not all_discovered_flags:
+                    print(" [-] [Modul Deep Strings] Selesai (Belum menemukan flag).")
+            except Exception as e:
+                print(f" [-] [Modul Deep Strings] Terjadi kendala: {e}")
+
+        module_map = {
+            "NETWORK": run_module_network,
+            "MEMORY": run_module_memory,
+            "ESP32": run_module_esp32,
+            "IMAGE": run_module_stego,
+            "SVG": run_module_svg,
+            "PDF": run_module_pdf,
+            "OFFICE": run_module_office,
+            "AUDIO": run_module_audio,
+            "DATABASE": run_module_db,
+            "LOG": run_module_sys,
+            "EMAIL": run_module_eml,
+            "LNK": run_module_lnk,
+            "MFT": run_module_mft,
+            "DISK": run_module_disk,
+            "ARCHIVE": run_module_archive,
+            "DEEP_STRINGS": run_module_deep_strings
+        }
+
+        # 1. Tentukan Modul Target Utama Berdasarkan Deteksi Tahap 1
+        primary_module = None
+        if "Network" in detected_cat:
+            primary_module = "NETWORK"
+        elif "Memory" in detected_cat or (file_size > 100 * 1024 * 1024 and not primary_ext in ("ad1", "e01", "vmdk")):
+            primary_module = "MEMORY"
+        elif "ESP32" in detected_cat:
+            primary_module = "ESP32"
         elif "Citra Digital" in detected_cat:
-            print(" [*] Menjalankan modul audit steganografi gambar...")
-            s_res = stego_engine.audit_image_steganography(file_path)
-            task_results["stego"] = s_res
-            for fl in s_res.get("flags_found", []):
-                on_instant_flag(fl, "Stego")
-            if s_res.get("anomalies"):
-                for an in s_res["anomalies"]:
-                    print(f" [+] Anomali Gambar: {an}")
-
-        # D. CITRA VEKTOR SVG / XML
+            primary_module = "IMAGE"
         elif "SVG" in detected_cat or primary_ext == "svg":
-            print(" [*] Menjalankan modul forensik SVG (<tspan>/<text> inspection)...")
-            svg_res = stego_engine.analyze_svg(file_path)
-            task_results["svg"] = svg_res
-            for fl in svg_res.get("flags_found", []):
-                on_instant_flag(fl, "SVG Inspector")
-            if svg_res.get("extracted_text"):
-                print(f" [+] Teks <tspan> terkumpul: \033[1;32m{svg_res['extracted_text'][:80]}\033[0m")
-
-        # E. DOKUMEN PDF
+            primary_module = "SVG"
         elif "PDF" in detected_cat or primary_ext == "pdf":
-            print(" [*] Menjalankan modul ekstraksi PDF (FlateDecode & Redaction unmasking)...")
-            pdf_res = stego_engine.analyze_pdf(file_path)
-            task_results["pdf"] = pdf_res
-            for fl in pdf_res.get("flags_found", []):
-                on_instant_flag(fl, "PDF Inspector")
-            if pdf_res.get("streams_decompressed"):
-                print(f" [+] Stream FlateDecode berhasil didekompresi: {pdf_res['streams_decompressed']}")
-
-        # F. DOKUMEN OFFICE OPENXML
+            primary_module = "PDF"
         elif "Office" in detected_cat or primary_ext in ("pptx", "docx", "xlsx"):
-            print(" [*] Menjalankan modul inspeksi Office OpenXML...")
-            doc_res = stego_engine.analyze_office_document(file_path)
-            task_results["office"] = doc_res
-            for fl in doc_res.get("flags_found", []):
-                on_instant_flag(fl, "Office XML")
-            if doc_res.get("hidden_entries"):
-                print(f" [+] Entri dokumen tersembunyi: {doc_res['hidden_entries']}")
-
-        # G. AUDIO / SINYAL
+            primary_module = "OFFICE"
         elif "Audio" in detected_cat or "3D" in detected_cat:
-            print(" [*] Menjalankan modul sinyal audio & telemetri...")
-            sig_res = signal_engine.inspect_audio_signals(file_path)
-            task_results["signal"] = sig_res
-            for fl in sig_res.get("flags_found", []):
-                on_instant_flag(fl, "Signal/Audio")
-            if sig_res.get("dtmf_digits"):
-                print(f" [+] Nada Telepon DTMF Terdeteksi: \033[1;32m{sig_res['dtmf_digits']}\033[0m")
-
-        # H. DATABASE SQLITE
+            primary_module = "AUDIO"
         elif "Database" in detected_cat:
-            print(" [*] Menjalankan modul deep SQLite forensics...")
-            d_res = db_inspector.inspect_database(file_path)
-            task_results["db"] = d_res
-            for fl in d_res.get("flags_found", []):
-                on_instant_flag(fl, "Database")
-            if d_res.get("tables"):
-                print(f" [+] Tabel SQLite: {', '.join(d_res['tables'][:8])}")
-
-        # I. LOG SISTEM / EVTX
+            primary_module = "DATABASE"
         elif "Log" in detected_cat:
-            print(" [*] Menjalankan modul audit log sistem (EVTX)...")
-            sys_res = system_inspector.inspect_evtx(file_path)
-            task_results["sys"] = sys_res
-            for fl in sys_res.get("flags_found", []):
-                on_instant_flag(fl, "EVTX Log")
-            if sys_res.get("decoded_commands"):
-                print(f" [+] PowerShell -EncodedCommand Decoded: {len(sys_res['decoded_commands'])} perintah")
-
-        # J. DISK & PARTISI
+            primary_module = "LOG"
+        elif "Email" in detected_cat:
+            primary_module = "EMAIL"
+        elif "LNK" in detected_cat:
+            primary_module = "LNK"
+        elif "MFT" in detected_cat:
+            primary_module = "MFT"
         elif "Disk" in detected_cat or primary_ext == "ad1":
-            print(" [*] Menjalankan modul disk artifacts & partitions...")
-            if primary_ext == "ad1":
-                ad_res = ad1_parser.parse_ad1(file_path)
-                task_results["ad1"] = ad_res
-                for fl in ad_res.get("flags_found", []):
-                    on_instant_flag(fl, "AD1")
-            else:
-                disk_res = disk_inspector.inspect_disk_artifacts(file_path)
-                task_results["disk"] = disk_res
-                for fl in disk_res.get("flags_found", []):
-                    on_instant_flag(fl, "Disk")
-
-        # K. ARSIP TERKOMPRESI (DENGAN DEEP REKURSIF PADA ARTEFAK TERKESTRAK)
+            primary_module = "DISK"
         elif "Arsip" in detected_cat:
-            print(" [*] Mengekstrak arsip terkompresi...")
-            unpacked_dir = os.path.join(target_out_dir, "unpacked")
-            arch_res = archive_unpacker.unpack(file_path, unpacked_dir, candidate_passwords=list(candidate_passwords))
-            task_results["archive"] = arch_res
-            if arch_res.get("success"):
-                ext_files = arch_res.get("extracted_files", [])
-                print(f" [OK] Berhasil mengekstrak {len(ext_files)} file.")
-                for ef in ext_files:
-                    ef_path = ef["path"]
-                    ef_name = ef.get("filename", "")
-                    ef_ext = Path(ef_path).suffix.lower().lstrip(".")
-                    try:
-                        with open(ef_path, "rb") as ef_f:
-                            ef_data = ef_f.read(16 * 1024 * 1024)
-                        for fl in string_hunter.hunt_flags(ef_data):
-                            on_instant_flag(fl, f"Extracted ({ef_name})")
+            primary_module = "ARCHIVE"
 
-                        # Deep inspection for specialized extracted formats
-                        if ef_ext in ("lime", "dmp", "vmem") or ef_data.startswith(b"EMiL"):
-                            m_sub = memory_streamer.scan_memory_dump(ef_path, on_flag_found=lambda fl: on_instant_flag(fl, f"Extracted Memory ({ef_name})"), early_stop=stop_on_flag)
-                            for fl in m_sub.get("flags_found", []):
-                                on_instant_flag(fl, f"Extracted Memory ({ef_name})")
-                        elif ef_ext == "evtx" or ef_data.startswith(b"ElfFile\x00"):
-                            ev_sub = system_inspector.analyze_evtx_or_logs(ef_path)
-                            for fl in ev_sub.get("flags_found", []):
-                                on_instant_flag(fl, f"Extracted EVTX ({ef_name})")
-                        elif ef_ext in ("pcap", "pcapng") or ef_data.startswith((b"\xd4\xc3\xb2\xa1", b"\n\r\r\n")):
-                            p_sub = pcap_analyzer.analyze_pcap(ef_path)
-                            for fl in p_sub.get("flags_found", []):
-                                on_instant_flag(fl, f"Extracted PCAP ({ef_name})")
-                        elif ef_ext in ("png", "jpg", "jpeg", "bmp"):
-                            s_sub = stego_engine.audit_image_steganography(ef_path)
-                            for fl in s_sub.get("flags_found", []):
-                                on_instant_flag(fl, f"Extracted Image ({ef_name})")
-                        elif ef_ext == "pdf":
-                            pdf_sub = stego_engine.analyze_pdf(ef_path)
-                            for fl in pdf_sub.get("flags_found", []):
-                                on_instant_flag(fl, f"Extracted PDF ({ef_name})")
-                        elif ef_ext == "svg":
-                            svg_sub = stego_engine.analyze_svg(ef_path)
-                            for fl in svg_sub.get("flags_found", []):
-                                on_instant_flag(fl, f"Extracted SVG ({ef_name})")
-                    except Exception:
-                        pass
+        # Eksekusi modul utama jika ada
+        if primary_module and primary_module in module_map:
+            print(f" [+] Menjalankan modul target utama: \033[1;36m{primary_module}\033[0m")
+            executed_modules.add(primary_module)
+            module_map[primary_module]()
+
+        # 2. ADAPTIVE FALLBACK ENGINE
+        # Jika belum ada flag, atau jika modul utama tidak menghasilkan flag
+        if not stop_signal[0] and not all_discovered_flags:
+            print("\n\033[1;33m[*] [Adaptive Fallback Engine] Flag belum terdeteksi. Menganalisis karakteristik biner & mencoba tahap alternatif non-konflik...\033[0m")
+
+            fallback_order = []
+
+            # Prioritas A: Cek apakah file bisa diekstrak sebagai arsip (ZIP / 7z / TAR)
+            if "ARCHIVE" not in executed_modules:
+                if (
+                    b"PK\x03\x04" in header_sample
+                    or b"7z\xbc\xaf" in header_sample
+                    or header_sample.startswith((b"PK", b"7z", b"\x1f\x8b", b"BZh"))
+                    or primary_ext in ("zip", "7z", "tar", "gz", "bz2", "xz", "rar")
+                ):
+                    fallback_order.append("ARCHIVE")
+
+            # Prioritas B: Cek PDF
+            if "PDF" not in executed_modules:
+                if b"%PDF" in header_sample[:65536]:
+                    fallback_order.append("PDF")
+
+            # Prioritas C: Cek Steganografi Citra (PNG / JPG / BMP)
+            if "IMAGE" not in executed_modules:
+                if (
+                    b"IHDR" in header_sample[:64]
+                    or header_sample.startswith((b"\x89PNG", b"\xff\xd8\xff", b"BM"))
+                    or primary_ext in ("png", "jpg", "jpeg", "bmp", "gif", "webp")
+                ):
+                    fallback_order.append("IMAGE")
+
+            # Prioritas D: Cek Network PCAP
+            if "NETWORK" not in executed_modules:
+                if (
+                    header_sample.startswith((b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x0a\x0d\x0d\x0a"))
+                    or primary_ext in ("pcap", "pcapng", "cap")
+                ):
+                    fallback_order.append("NETWORK")
+
+            # Prioritas E: Cek Disk Image / AD1 / MFT
+            if "DISK" not in executed_modules:
+                if (
+                    header_sample.startswith(b"ADSEGMENTED")
+                    or primary_ext in ("ad1", "img", "raw", "vmdk", "e01")
+                ):
+                    fallback_order.append("DISK")
+
+            if "MFT" not in executed_modules:
+                if b"FILE0" in header_sample[:2048] or b"FILE*" in header_sample[:2048]:
+                    fallback_order.append("MFT")
+
+            # Prioritas F: Cek Memory Dump jika ukuran file cukup besar (> 5MB)
+            if "MEMORY" not in executed_modules:
+                if (
+                    header_sample.startswith((b"EMiL", b"LiME"))
+                    or (file_size > 8 * 1024 * 1024 and not primary_ext in ("ad1", "e01", "vmdk", "pcap", "pcapng"))
+                ):
+                    fallback_order.append("MEMORY")
+
+            # Prioritas G: Cek LNK Shortcut
+            if "LNK" not in executed_modules:
+                if header_sample.startswith(b"\x4c\x00\x00\x00\x01\x14\x02\x00"):
+                    fallback_order.append("LNK")
+
+            # Prioritas H: Cek Email
+            if "EMAIL" not in executed_modules:
+                if b"From:" in header_sample[:1024] or b"Subject:" in header_sample[:1024]:
+                    fallback_order.append("EMAIL")
+
+            # Prioritas I: Cek SQLite Database
+            if "DATABASE" not in executed_modules:
+                if header_sample.startswith(b"SQLite format 3"):
+                    fallback_order.append("DATABASE")
+
+            # Prioritas J: Cek Log EVTX
+            if "LOG" not in executed_modules:
+                if header_sample.startswith(b"ElfFile\x00"):
+                    fallback_order.append("LOG")
+
+            # Jalankan fallback yang cocok dengan karakteristik biner
+            for fb_mod in fallback_order:
+                if stop_signal[0] or (all_discovered_flags and stop_on_flag):
+                    break
+                if fb_mod not in executed_modules:
+                    print(f" [*] [Adaptive Fallback] Mencoba kandidat: \033[1;36m{fb_mod}\033[0m")
+                    executed_modules.add(fb_mod)
+                    module_map[fb_mod]()
+
+            # Terakhir: Jika masih belum ada flag, coba ekstrak arsip universal & deep string scan
+            if not stop_signal[0] and not all_discovered_flags:
+                if "ARCHIVE" not in executed_modules:
+                    print(" [*] [Adaptive Fallback] Mencoba universal archive extraction (7z/carver)...")
+                    executed_modules.add("ARCHIVE")
+                    run_module_archive()
+
+            if not stop_signal[0] and not all_discovered_flags:
+                if "DEEP_STRINGS" not in executed_modules:
+                    executed_modules.add("DEEP_STRINGS")
+                    run_module_deep_strings()
 
     # =========================================================================
     # TAHAP 7: KESIMPULAN TEMUAN & SOLVER PLAYBOOK
@@ -761,47 +1030,78 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     )
     reporter.print_triage_advisory(triage_assessment)
 
-    # Simpan laporan
-    report_payload = {
-        "target_file": file_path,
-        "file_size_bytes": file_size,
-        "format_identification": fmt_info,
-        "detected_category": detected_cat,
-        "elapsed_seconds": round(elapsed, 2),
-        "all_flags": all_discovered_flags,
-        "triage_assessment": triage_assessment,
-        "eof_overlay": task_results["overlay"] is not None,
-        "carved_artifacts": task_results["carved"]
-    }
-    json_path, md_path = reporter.save_reports(report_payload)
-    print(f" [*] Markdown Report: \033[1;34m{md_path}\033[0m")
-    print(f" [*] Folder Artefak:  \033[1;34m{target_out_dir}\033[0m\n")
+    # Tampilkan daftar file hasil ekstraksi/artefak jika ada
+    saved_artifacts = []
+    if os.path.exists(target_out_dir):
+        for r, _, fnames in os.walk(target_out_dir):
+            for fn in fnames:
+                if fn not in ("report.json", "report.md"):
+                    fp = os.path.join(r, fn)
+                    rel_p = os.path.relpath(fp, target_out_dir)
+                    saved_artifacts.append((rel_p, os.path.getsize(fp)))
 
-    return report_payload
+    if saved_artifacts:
+        print(f" [*] Folder Output:   \033[1;34m{target_out_dir}\033[0m")
+        print(f"\n \033[1;36m[+] File Ter-ekstrak ({len(saved_artifacts)} file tersimpan):\033[0m")
+        for rel_name, sz in saved_artifacts[:15]:
+            print(f"     -> \033[1;32m{rel_name}\033[0m ({sz:,} bytes)")
+        if len(saved_artifacts) > 15:
+            print(f"     ... ({len(saved_artifacts) - 15} file lainnya di folder output)")
+    else:
+        # Bersihkan folder jika tidak ada file yang diekstrak dan merupakan folder default
+        if output_base is None or output_base == "results":
+            try:
+                os.rmdir(target_out_dir)
+            except Exception:
+                pass
+    print()
+
+    return {
+        "target_file": file_path,
+        "all_flags": all_discovered_flags,
+        "saved_artifacts": saved_artifacts
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="foren.py - CTF Forensics Automated Diagnostic & Solver",
+        prog="foren",
+        description="\033[1;36m[*] Analysis Foren - CTF Forensics Automated Diagnostic & Solver\033[0m",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Contoh Pemakaian:
-  python foren.py challenge.png
-  python foren.py traffic.pcapng
-  python foren.py memory.lime
-  python foren.py dump.raw --no-stop
-        """
+        epilog="""\033[1;33mKEMAMPUAN ANALISIS TERCAKUP:\033[0m
+  [1] PCAP / PCAPNG     : USB HID Keystroke & Mouse drawing, Creds, Timing/Covert, TLS
+  [2] Steganografi Citra: PNG IHDR repair, JPG DQT LSB, Steghide, LSB Bitplanes, OCR
+  [3] Dokumen & PDF     : PDF FlateDecode, Unmask Redactions, pdf2john + dictionary attack
+  [4] RAM Memory Dumps  : Zero-OOM LiME parser, de-LiME, Bash history, Volatility 3
+  [5] Disk & Partition  : AD1 Evidence Container, MFT Records, GPT, RAID5 XOR Recovery
+  [6] Arsip Kompresi    : ZIP/7z/TAR/GZ recursive unpacking, password cracking
+  [7] IoT & Firmware    : ESP32 Flash Memory & NVS XOR 0x80 recovery
+  [8] System Logs & EML : EVTX PowerShell -EncodedCommand, EML phishing triage
+
+\033[1;32mCONTOH PENGGUNAAN:\033[0m
+  foren challenge.png
+  foren challenge.png -o ./output
+  foren challenge.png -o /home/ramdhan/FinalHackToday/output
+  foren babyshark.pcapng -o ./pcap_extracted
+  foren memory.lime --delime -o ./ram_hasil
+  foren secret.pdf -o ./pdf_out
+  foren dump.raw --no-stop
+"""
     )
     parser.add_argument("target", nargs="?", help="Path ke file soal forensik CTF yang ingin dianalisis")
-    parser.add_argument("--no-stop", dest="stop_on_flag", action="store_false", default=True, help="Lakukan deep scan tuntas tanpa berhenti pada flag pertama")
-    parser.add_argument("--delime", action="store_true", help="Ekstrak / de-LiME format .lime menjadi raw physical RAM (.raw)")
-    parser.add_argument("--outdir", default="results", help="Folder output hasil analisis (default: results)")
+    parser.add_argument("-o", "--output", "--outdir", dest="output", default=None,
+                        help="Folder tujuan hasil analisa, gambar ter-ekstrak, PDF, dan artefak (dibuat otomatis jika belum ada)")
+    parser.add_argument("--no-stop", dest="stop_on_flag", action="store_false", default=True,
+                        help="Lakukan deep scan tuntas tanpa berhenti pada flag pertama")
+    parser.add_argument("--delime", action="store_true",
+                        help="Ekstrak / de-LiME format .lime menjadi raw physical RAM (.raw)")
 
     args = parser.parse_args()
 
     if not args.target:
         parser.print_help()
-        print("\n\033[1;33mContoh: python foren.py <nama_file_soal>\033[0m")
-        sys.exit(1)
+        print("\n\033[1;33mContoh Cepat: foren <nama_file_soal> -o ./output\033[0m\n")
+        sys.exit(0)
 
     target_path = os.path.abspath(args.target)
     if not os.path.exists(target_path):
@@ -813,9 +1113,10 @@ def main():
         for root, _, files in os.walk(target_path):
             for file in files:
                 p = os.path.join(root, file)
-                run_forensic_solver(p, stop_on_flag=args.stop_on_flag, output_base=args.outdir, delime=args.delime)
+                sub_out = os.path.join(args.output, f"out_{file}") if args.output else None
+                run_forensic_solver(p, stop_on_flag=args.stop_on_flag, output_base=sub_out, delime=args.delime)
     else:
-        run_forensic_solver(target_path, stop_on_flag=args.stop_on_flag, output_base=args.outdir, delime=args.delime)
+        run_forensic_solver(target_path, stop_on_flag=args.stop_on_flag, output_base=args.output, delime=args.delime)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 memodump.py - Memory Dump Analyzer
 Scans .lime, .raw, .dmp, .vmem memory dumps for flags, bash history, env vars, SSH keys.
@@ -50,7 +50,7 @@ def main():
         try:
             cmd = ["wsl", "-d", distro, "bash", "-c",
                    f"strings -n 6 '{wsl_path}' | grep -aEi '({grep_pats})' | head -200"]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
             if proc.returncode == 0 and proc.stdout.strip():
                 print(f"[!] WSL strings ({distro}) menemukan:")
                 for line in proc.stdout.strip().splitlines():

@@ -23,6 +23,32 @@ from core.peripheral_hunter import PeripheralHunter
 from core.string_hunter import StringHunter
 
 
+def to_wsl_path(win_path: str) -> str:
+    """Convert Windows path to WSL /mnt/<drive>/... path."""
+    abs_p = os.path.abspath(win_path)
+    drive, rest = os.path.splitdrive(abs_p)
+    clean_rest = rest.replace("\\", "/")
+    if drive:
+        return f"/mnt/{drive[0].lower()}" + clean_rest
+    return clean_rest
+
+
+def find_tshark_cmd() -> Optional[List[str]]:
+    """Locate tshark binary on Windows or inside WSL Kali."""
+    if shutil.which("tshark"):
+        return ["tshark"]
+    for prog in [r"C:\Program Files\Wireshark\tshark.exe", r"C:\Program Files (x86)\Wireshark\tshark.exe"]:
+        if os.path.exists(prog):
+            return [prog]
+    try:
+        chk = subprocess.run(["wsl", "-u", "root", "-d", "kali-linux", "which", "tshark"], capture_output=True, text=True, timeout=5)
+        if chk.returncode == 0 and "tshark" in chk.stdout:
+            return ["wsl", "-u", "root", "-d", "kali-linux", "tshark"]
+    except Exception:
+        pass
+    return None
+
+
 class PcapAnalyzer:
     """Analyzes PCAP and PCAPNG files with pure Python and tshark acceleration."""
 
@@ -31,7 +57,8 @@ class PcapAnalyzer:
         os.makedirs(self.output_dir, exist_ok=True)
         self.string_hunter = StringHunter()
         self.peripheral_hunter = PeripheralHunter(self.output_dir)
-        self.has_tshark = shutil.which("tshark") is not None
+        self.tshark_cmd = find_tshark_cmd()
+        self.has_tshark = self.tshark_cmd is not None
 
     def analyze(self, filepath: str) -> Dict[str, Any]:
         """Perform comprehensive network forensics triage on a capture file."""
@@ -55,15 +82,7 @@ class PcapAnalyzer:
             "tshark_summary": None
         }
 
-        # 1. Run tshark analysis if available
-        if self.has_tshark:
-            try:
-                results["tshark_summary"] = self._run_tshark_triage(filepath)
-                results["engine"] = "hybrid (native + tshark)"
-            except Exception:
-                pass
-
-        # 2. Native Pure-Python PCAP/PCAPNG parsing
+        # 1. Native Pure-Python PCAP/PCAPNG parsing (Fast native triage)
         try:
             with open(filepath, "rb") as f:
                 header = f.read(4)
@@ -76,6 +95,14 @@ class PcapAnalyzer:
                     results["error"] = "Unrecognized PCAP magic header"
         except Exception as e:
             results["error"] = f"PCAP parsing exception: {str(e)}"
+
+        # 2. Run tshark analysis if available and needed
+        if self.has_tshark and not results.get("flags_found"):
+            try:
+                results["tshark_summary"] = self._run_tshark_triage(filepath, results)
+                results["engine"] = "hybrid (native + tshark)"
+            except Exception:
+                pass
 
         # Convert set of protocols to sorted list for JSON serialization
         if isinstance(results["protocols"], set):
@@ -254,18 +281,30 @@ class PcapAnalyzer:
 
         results["streams_found"] = len(tcp_streams)
 
-        # 1. Deep Grep across all assembled TCP streams
+        # 1. Fast Grep across all assembled TCP streams
         for stream_id, payload in tcp_streams.items():
-            flags = self.string_hunter.hunt_flags(bytes(payload))
+            p_bytes = bytes(payload)[:128 * 1024]
+            flags = self.string_hunter.hunt_flags(p_bytes, fast_only=True)
             for f in flags:
                 f["context"] = f"[Stream {stream_id[0][0]}:{stream_id[0][1]} <-> {stream_id[1][0]}:{stream_id[1][1]}] {f['context']}"
                 results["flags_found"].append(f)
 
-            sus = self.string_hunter.hunt_suspicious_patterns(bytes(payload), limit_per_type=3)
+            sus = self.string_hunter.hunt_suspicious_patterns(p_bytes, limit_per_type=2)
             for k, v in sus.items():
                 if k not in results["suspicious_patterns"]:
                     results["suspicious_patterns"][k] = []
                 results["suspicious_patterns"][k].extend(v)
+
+        # Deep Cipher Hunt only on candidate streams if no flags discovered yet
+        if not results["flags_found"] and tcp_streams:
+            for stream_id, payload in list(tcp_streams.items())[:5]:
+                p_bytes = bytes(payload)[:64 * 1024]
+                deep_flags = self.string_hunter.hunt_flags(p_bytes, early_stop=True)
+                for f in deep_flags:
+                    f["context"] = f"[Stream {stream_id[0][0]}:{stream_id[0][1]} <-> {stream_id[1][0]}:{stream_id[1][1]}] {f['context']}"
+                    results["flags_found"].append(f)
+                if results["flags_found"]:
+                    break
 
         # 2. Decode USB HID Keyboard keystrokes
         if hid_reports:
@@ -412,8 +451,8 @@ class PcapAnalyzer:
                                 except Exception:
                                     pass
 
-                # Scan flags in the carved body
-                for fl in self.string_hunter.hunt_flags(body):
+                # Scan flags in the carved body (fast scan first)
+                for fl in self.string_hunter.hunt_flags(body[:256 * 1024], fast_only=True):
                     fl["encoding"] = f"HTTP Carved Body ({fl['encoding']})"
                     fl["context"] = f"Stream {stream_id[0]} <-> {stream_id[1]}: {fl.get('context', '')}"
                     results["flags_found"].append(fl)
@@ -573,35 +612,147 @@ class PcapAnalyzer:
             "decoded": decoded_text or joined
         }
 
-    def _run_tshark_triage(self, filepath: str) -> Dict[str, Any]:
-        """Execute tshark commands to pull protocol hierarchy and export objects."""
+    def _run_tshark_triage(self, filepath: str, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute tshark commands to pull protocol hierarchy, export HTTP objects, and decrypt TLS."""
         tshark_info = {}
-        # Protocol Hierarchy
+        is_wsl = bool(self.tshark_cmd and self.tshark_cmd[0] == "wsl")
+        target_path = to_wsl_path(filepath) if is_wsl else os.path.abspath(filepath)
+
+        # 1. Protocol Hierarchy
         try:
-            p = subprocess.run(
-                ["tshark", "-r", filepath, "-qz", "io,phs"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            cmd = list(self.tshark_cmd) + ["-r", target_path, "-qz", "io,phs"]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if p.returncode == 0:
                 tshark_info["hierarchy"] = p.stdout.strip()
         except Exception:
             pass
 
-        # Export HTTP Objects
+        # 2. Export HTTP Objects
         http_export_dir = os.path.join(self.output_dir, "tshark_http_objects")
         os.makedirs(http_export_dir, exist_ok=True)
+        wsl_export_dir = to_wsl_path(http_export_dir) if is_wsl else http_export_dir
+
         try:
-            subprocess.run(
-                ["tshark", "-r", filepath, "--export-objects", f"http,{http_export_dir}"],
-                capture_output=True,
-                timeout=10
-            )
+            cmd = list(self.tshark_cmd) + ["-r", target_path, "--export-objects", f"http,{wsl_export_dir}"]
+            subprocess.run(cmd, capture_output=True, timeout=6)
             exported = os.listdir(http_export_dir)
             if exported:
                 tshark_info["http_objects_exported"] = exported
+                keylog_file = None
+                nested_pcaps = []
+
+                for obj_name in exported:
+                    obj_path = os.path.join(http_export_dir, obj_name)
+                    if not os.path.isfile(obj_path):
+                        continue
+                    try:
+                        with open(obj_path, "rb") as of:
+                            content = of.read()
+                        for fl in self.string_hunter.hunt_flags(content[:256 * 1024], fast_only=True):
+                            fl["source_file"] = obj_name
+                            results["flags_found"].append(fl)
+
+                        if any(marker in content for marker in (b"CLIENT_RANDOM", b"CLIENT_HANDSHAKE_TRAFFIC_SECRET", b"SERVER_HANDSHAKE_TRAFFIC_SECRET")) or "sslkey" in obj_name.lower():
+                            keylog_file = obj_path
+
+                        if content.startswith((b"\xd4\xc3\xb2\xa1", b"\xa1\xb2\xc3\xd4", b"\x0a\x0d\x0d\x0a")):
+                            nested_pcaps.append(obj_path)
+                    except Exception:
+                        pass
+
+                # If keylog was found, decrypt nested captures or original pcap
+                if keylog_file:
+                    tshark_info["ssl_keylog_detected"] = keylog_file
+                    dec_dir = os.path.join(self.output_dir, "tls_decrypted_objects")
+                    os.makedirs(dec_dir, exist_ok=True)
+                    wsl_dec_dir = to_wsl_path(dec_dir) if is_wsl else dec_dir
+                    wsl_keylog = to_wsl_path(keylog_file) if is_wsl else keylog_file
+
+                    targets_to_decrypt = nested_pcaps if nested_pcaps else [filepath]
+                    for target_pcap in targets_to_decrypt:
+                        wsl_target_pcap = to_wsl_path(target_pcap) if is_wsl else target_pcap
+                        try:
+                            dec_cmd = list(self.tshark_cmd) + [
+                                "-r", wsl_target_pcap,
+                                "-o", f"tls.keylog_file:{wsl_keylog}",
+                                "--export-objects", f"http,{wsl_dec_dir}"
+                            ]
+                            subprocess.run(dec_cmd, capture_output=True, timeout=15)
+                            for dec_f in os.listdir(dec_dir):
+                                df_path = os.path.join(dec_dir, dec_f)
+                                if os.path.isfile(df_path):
+                                    with open(df_path, "rb") as df:
+                                        df_content = df.read()
+                                    for fl in self.string_hunter.hunt_flags(df_content):
+                                        fl["source_file"] = f"decrypted/{dec_f}"
+                                        fl["encoding"] = f"TLS Decrypted HTTP ({fl['encoding']})"
+                                        results["flags_found"].append(fl)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # 3. TrevorC2 Triage
+        try:
+            self._triage_trevorc2(filepath, results)
         except Exception:
             pass
 
         return tshark_info
+
+    def _triage_trevorc2(self, filepath: str, results: Dict[str, Any]):
+        """Inspect PCAP for TrevorC2 covert communications and decrypt traffic."""
+        try:
+            with open(filepath, "rb") as f:
+                raw_data = f.read()
+        except Exception:
+            return
+
+        oldcss_matches = re.findall(rb"oldcss=([a-zA-Z0-9+/=]+)", raw_data)
+        guid_matches = re.findall(rb"guid=([a-zA-Z0-9+/=]+)", raw_data)
+        if not oldcss_matches and not guid_matches:
+            return
+
+        import hashlib
+        try:
+            from Crypto.Cipher import AES
+        except ImportError:
+            return
+
+        ciphers_to_try = [
+            "Tr3v0rC2R0x@nd1s@w350m3#TrevorForget",
+            "Tr3v0rC2IsAlive",
+            "TrevorC2",
+            "Tr3v0rC2"
+        ]
+
+        decrypted_texts = []
+        for cipher_pass in ciphers_to_try:
+            key = hashlib.sha256(cipher_pass.encode()).digest()
+            for b64_cand in set(oldcss_matches + guid_matches):
+                try:
+                    raw = base64.b64decode(b64_cand)
+                    if len(raw) < 32 or len(raw) % 16 != 0:
+                        continue
+                    iv = raw[:16]
+                    ct = raw[16:]
+                    cipher = AES.new(key, AES.MODE_CBC, iv)
+                    pt = cipher.decrypt(ct)
+                    pad_len = pt[-1]
+                    if isinstance(pad_len, int) and 1 <= pad_len <= 16:
+                        pt = pt[:-pad_len]
+                    if pt and pt != b"nothing" and any(32 <= b <= 126 for b in pt):
+                        txt = pt.decode("latin-1", errors="ignore")
+                        decrypted_texts.append(txt)
+                        for fl in self.string_hunter.hunt_flags(pt):
+                            fl["encoding"] = f"TrevorC2 Decrypted ({fl['encoding']})"
+                            results["flags_found"].append(fl)
+                except Exception:
+                    pass
+
+        if decrypted_texts:
+            results["trevorc2_traffic"] = {
+                "detected": True,
+                "decrypted_snippets": decrypted_texts[:10]
+            }
+

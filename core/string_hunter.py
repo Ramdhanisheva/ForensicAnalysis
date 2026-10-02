@@ -7,7 +7,7 @@ and suspicious pattern detection.
 import base64
 import re
 import urllib.parse
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import config
 
@@ -116,6 +116,12 @@ class StringHunter:
     def __init__(self):
         self.flag_patterns = config.FLAG_PATTERNS
         self.suspicious_regex = config.SUSPICIOUS_REGEX
+        self.xor_stems = [b"HackToday", b"sunctf{", b"picoCTF{", b"flag{", b"CTF{", b"GICTF{", b"EQCTF{", b"L3AK{"]
+        self._precomputed_xor_table = [
+            (key, xp, bytes(b ^ key for b in xp))
+            for key in range(1, 256)
+            for xp in self.xor_stems
+        ]
 
     def extract_ascii_strings(self, data: bytes, min_len: int = 4) -> List[str]:
         """Fast extraction of printable ASCII strings from raw bytes."""
@@ -156,7 +162,8 @@ class StringHunter:
         text_or_bytes,
         early_stop: bool = False,
         on_flag_found=None,
-        depth: int = 0
+        depth: int = 0,
+        fast_only: bool = False
     ) -> List[Dict[str, str]]:
         """
         Scan for flags in plaintext and across multiple encoding/cipher layers:
@@ -200,20 +207,52 @@ class StringHunter:
         if early_stop and found_flags:
             return found_flags
 
-        # 2. URL-encoded scan
-        if "%" in raw_text:
-            unquoted = urllib.parse.unquote(raw_text)
+        sample_256k = raw_text[:256 * 1024]
+        sample_1mb = raw_text[:1024 * 1024]
+
+        # 2. String Concatenation & URL-encoded scan
+        # Deobfuscate script string additions: 'str1' + 'str2' or "str1" + "str2"
+        if "+" in sample_256k and ("'" in sample_256k or '"' in sample_256k):
+            deobf_concat = re.sub(r"""['"]\s*\+\s*['"]""", "", sample_256k)
+            if deobf_concat != sample_256k:
+                intermediate_texts.append(deobf_concat)
+                for pattern in self.flag_patterns:
+                    for match in pattern.finditer(deobf_concat):
+                        flag = match.group(0).strip()
+                        _record_flag(flag, "Concatenated String Deobfuscated", deobf_concat[max(0, match.start() - 20):min(len(deobf_concat), match.end() + 20)].strip())
+
+        if "%" in sample_256k:
+            unquoted = urllib.parse.unquote(sample_256k)
             intermediate_texts.append(unquoted)
             for pattern in self.flag_patterns:
                 for match in pattern.finditer(unquoted):
                     flag = match.group(0).strip()
                     _record_flag(flag, "URL-decoded", unquoted[max(0, match.start() - 20):min(len(unquoted), match.end() + 20)].strip())
 
+        # URL path tokens scan (Base64/Base58 embedded in URI segments)
+        url_tokens = re.findall(r"/[A-Za-z0-9+/%=._-]{12,}", sample_256k)
+        for ut in set(url_tokens):
+            clean_tok = urllib.parse.unquote(ut.lstrip("/").split("/")[0].split("?")[0])
+            intermediate_texts.append(clean_tok)
+            try:
+                # Try Base64 on clean token
+                pad_len = (4 - len(clean_tok) % 4) % 4
+                dec_b64 = base64.b64decode((clean_tok + ("=" * pad_len)).encode("ascii"), validate=False)
+                dec_str = dec_b64.decode("latin-1", errors="ignore")
+                for pattern in self.flag_patterns:
+                    for match in pattern.finditer(dec_str):
+                        _record_flag(match.group(0).strip(), f"URL Path Base64 (token: {clean_tok[:30]}...)", dec_str[:100].strip())
+            except Exception:
+                pass
+
         if early_stop and found_flags:
             return found_flags
 
+        sample_256k = raw_text[:256 * 1024]
+        sample_1mb = raw_text[:1024 * 1024]
+
         # 3. Base64 scan
-        b64_matches = re.findall(r"[A-Za-z0-9+/]{12,}={0,2}", raw_text)
+        b64_matches = re.findall(r"[A-Za-z0-9+/]{12,}={0,2}", sample_1mb)
         for cand in set(b64_matches):
             try:
                 pad_len = (4 - len(cand) % 4) % 4
@@ -242,7 +281,7 @@ class StringHunter:
             return found_flags
 
         # 4. Base32 scan (RFC 4648)
-        b32_matches = re.findall(r"\b[A-Z2-7=]{16,}\b", raw_text.upper())
+        b32_matches = re.findall(r"\b[A-Z2-7=]{16,}\b", sample_256k.upper())
         for cand in set(b32_matches):
             try:
                 pad_len = (8 - len(cand) % 8) % 8
@@ -260,7 +299,7 @@ class StringHunter:
             return found_flags
 
         # 5. Base85 & Ascii85 scan
-        b85_matches = re.findall(r"[0-9a-zA-Z!#$%&()*+;<=>?@^_`{|}~-]{16,}", raw_text)
+        b85_matches = re.findall(r"[0-9a-zA-Z!#$%&()*+;<=>?@^_`{|}~-]{16,}", sample_256k)
         for cand in set(b85_matches):
             try:
                 dec = base64.b85decode(cand.encode("ascii"))
@@ -272,7 +311,7 @@ class StringHunter:
             except Exception:
                 pass
 
-        a85_matches = re.findall(r"[!-u]{16,}", raw_text)
+        a85_matches = re.findall(r"[!-u]{16,}", sample_256k)
         for cand in set(a85_matches):
             try:
                 dec = base64.a85decode(cand.encode("ascii"))
@@ -288,7 +327,7 @@ class StringHunter:
             return found_flags
 
         # 6. Base58 scan (Bitcoin format)
-        b58_matches = re.findall(r"\b[1-9A-HJ-NP-Za-km-z]{16,}\b", raw_text)
+        b58_matches = re.findall(r"\b[1-9A-HJ-NP-Za-km-z]{16,}\b", sample_256k)
         for cand in set(b58_matches):
             try:
                 dec = b58decode(cand)
@@ -305,7 +344,7 @@ class StringHunter:
             return found_flags
 
         # 7. Hex string & Hex escapes scan
-        hex_matches = re.findall(r"\b(?:[0-9a-fA-F]{2}){8,}\b", raw_text)
+        hex_matches = re.findall(r"\b(?:[0-9a-fA-F]{2}){8,}\b", sample_1mb)
         for h in set(hex_matches):
             try:
                 decoded_hex = bytes.fromhex(h).decode("latin-1", errors="ignore")
@@ -314,6 +353,20 @@ class StringHunter:
                     for match in pattern.finditer(decoded_hex):
                         flag = match.group(0).strip()
                         _record_flag(flag, f"Hex (raw: {h[:30]}...)", decoded_hex[:100].strip())
+            except Exception:
+                pass
+
+        # Space/colon/hyphen-separated hex bytes: 73 75 6e 63 74 66 ...
+        spaced_hex_matches = re.findall(r"\b(?:[0-9a-fA-F]{2}[ :\-]){6,}[0-9a-fA-F]{2}\b", sample_1mb)
+        for sh in set(spaced_hex_matches):
+            try:
+                clean_sh = re.sub(r"[\s:\-]", "", sh)
+                dec_sh = bytes.fromhex(clean_sh).decode("latin-1", errors="ignore")
+                intermediate_texts.append(dec_sh)
+                for pattern in self.flag_patterns:
+                    for match in pattern.finditer(dec_sh):
+                        flag = match.group(0).strip()
+                        _record_flag(flag, f"Spaced Hex Bytes (raw: {sh[:30]}...)", dec_sh[:100].strip())
             except Exception:
                 pass
 
@@ -329,59 +382,62 @@ class StringHunter:
             except Exception:
                 pass
 
-        if early_stop and found_flags:
+        if (early_stop and found_flags) or fast_only:
             return found_flags
 
         # 8. Decimal Byte Stream scan (e.g. 72 97 99 107...)
-        dec_matches = re.findall(r"\b(?:(?:[3-9][0-9]|1[0-1][0-9]|12[0-6])[ ,;\-]+){4,}(?:[3-9][0-9]|1[0-1][0-9]|12[0-6])\b", raw_text)
-        for d in set(dec_matches):
-            try:
-                nums = [int(x) for x in re.split(r"[ ,;\-]+", d.strip()) if x]
-                dec_str = bytes(nums).decode("latin-1", errors="ignore")
-                intermediate_texts.append(dec_str)
-                for pattern in self.flag_patterns:
-                    for match in pattern.finditer(dec_str):
-                        _record_flag(match.group(0).strip(), "Decimal Byte Stream", dec_str[:100].strip())
-            except Exception:
-                pass
+        if any(c in sample_256k for c in "0123456789"):
+            dec_matches = re.findall(r"\b(?:(?:[3-9][0-9]|1[0-1][0-9]|12[0-6])[ ,;\-]+){4,}(?:[3-9][0-9]|1[0-1][0-9]|12[0-6])\b", sample_256k)
+            for d in set(dec_matches):
+                try:
+                    nums = [int(x) for x in re.split(r"[ ,;\-]+", d.strip()) if x]
+                    dec_str = bytes(nums).decode("latin-1", errors="ignore")
+                    intermediate_texts.append(dec_str)
+                    for pattern in self.flag_patterns:
+                        for match in pattern.finditer(dec_str):
+                            _record_flag(match.group(0).strip(), "Decimal Byte Stream", dec_str[:100].strip())
+                except Exception:
+                    pass
 
         if early_stop and found_flags:
             return found_flags
 
         # 9. Binary 8-bit Stream scan (e.g. 01001000 01100001...)
-        bin_matches = re.findall(r"\b(?:[01]{8}[ \t]*){4,}\b", raw_text)
-        for b in set(bin_matches):
-            try:
-                octets = re.findall(r"[01]{8}", b)
-                dec_str = bytes(int(x, 2) for x in octets).decode("latin-1", errors="ignore")
-                intermediate_texts.append(dec_str)
-                for pattern in self.flag_patterns:
-                    for match in pattern.finditer(dec_str):
-                        _record_flag(match.group(0).strip(), "Binary 8-bit Stream", dec_str[:100].strip())
-            except Exception:
-                pass
+        if "0" in sample_256k and "1" in sample_256k and ("010" in sample_256k or "011" in sample_256k):
+            bin_matches = re.findall(r"\b(?:[01]{8}[ \t]*){4,}\b", sample_256k)
+            for b in set(bin_matches):
+                try:
+                    octets = re.findall(r"[01]{8}", b)
+                    dec_str = bytes(int(x, 2) for x in octets).decode("latin-1", errors="ignore")
+                    intermediate_texts.append(dec_str)
+                    for pattern in self.flag_patterns:
+                        for match in pattern.finditer(dec_str):
+                            _record_flag(match.group(0).strip(), "Binary 8-bit Stream", dec_str[:100].strip())
+                except Exception:
+                    pass
 
         if early_stop and found_flags:
             return found_flags
 
         # 10. Octal Stream scan (e.g. \110\141\143...)
-        oct_matches = re.findall(r"(?:\\(?:[0-1]?[0-7]{2}|[0-7]{3})){4,}", raw_text)
-        for o in set(oct_matches):
-            try:
-                vals = [int(x, 8) for x in re.findall(r"\\([0-7]{2,3})", o)]
-                dec_str = bytes(vals).decode("latin-1", errors="ignore")
-                intermediate_texts.append(dec_str)
-                for pattern in self.flag_patterns:
-                    for match in pattern.finditer(dec_str):
-                        _record_flag(match.group(0).strip(), "Octal Stream", dec_str[:100].strip())
-            except Exception:
-                pass
+        if "\\" in sample_256k:
+            oct_matches = re.findall(r"(?:\\(?:[0-1]?[0-7]{2}|[0-7]{3})){4,}", sample_256k)
+            for o in set(oct_matches):
+                try:
+                    vals = [int(x, 8) for x in re.findall(r"\\([0-7]{2,3})", o)]
+                    dec_str = bytes(vals).decode("latin-1", errors="ignore")
+                    intermediate_texts.append(dec_str)
+                    for pattern in self.flag_patterns:
+                        for match in pattern.finditer(dec_str):
+                            _record_flag(match.group(0).strip(), "Octal Stream", dec_str[:100].strip())
+                except Exception:
+                    pass
 
         if early_stop and found_flags:
             return found_flags
 
         # 11. Reverse scan
-        rev_text = raw_text[::-1]
+        rev_text = sample_256k[::-1]
         for pattern in self.flag_patterns:
             for match in pattern.finditer(rev_text):
                 flag = match.group(0).strip()
@@ -391,74 +447,77 @@ class StringHunter:
             return found_flags
 
         # 12. ROT47 & Atbash
-        r47_cand = rot47(raw_text)
+        r47_cand = rot47(sample_256k)
         for pattern in self.flag_patterns:
             for match in pattern.finditer(r47_cand):
                 _record_flag(match.group(0).strip(), "ROT47", r47_cand[max(0, match.start() - 20):min(len(r47_cand), match.end() + 20)].strip())
 
-        atb_cand = atbash(raw_text)
+        atb_cand = atbash(sample_256k)
         for pattern in self.flag_patterns:
             for match in pattern.finditer(atb_cand):
                 _record_flag(match.group(0).strip(), "Atbash", atb_cand[max(0, match.start() - 20):min(len(atb_cand), match.end() + 20)].strip())
 
         # 13. Morse Code & Baconian Cipher
-        morse_candidates = re.findall(r"[.\-]{1,8}(?:[ \t]+[.\-]{1,8}){5,}", raw_text)
-        for mc in set(morse_candidates):
-            decoded_m = decode_morse(mc)
-            if decoded_m:
-                for pattern in self.flag_patterns:
-                    for match in pattern.finditer(decoded_m):
-                        _record_flag(match.group(0).strip(), "Morse Code", decoded_m[:100].strip())
-
-        bacon_cands = re.findall(r"\b[ABab]{20,}\b", raw_text)
-        for bc in set(bacon_cands):
-            for mode, m_label in ((bc.upper(), "Standard"), (bc.upper().replace("A", "X").replace("B", "A").replace("X", "B"), "Inverted")):
-                dec_b = decode_bacon(mode)
-                if dec_b:
+        if "." in sample_256k and "-" in sample_256k:
+            morse_candidates = re.findall(r"[.\-]{1,8}(?:[ \t]+[.\-]{1,8}){5,}", sample_256k)
+            for mc in set(morse_candidates):
+                decoded_m = decode_morse(mc)
+                if decoded_m:
                     for pattern in self.flag_patterns:
-                        for match in pattern.finditer(dec_b):
-                            _record_flag(match.group(0).strip(), f"Baconian Cipher ({m_label})", dec_b[:100].strip())
+                        for match in pattern.finditer(decoded_m):
+                            _record_flag(match.group(0).strip(), "Morse Code", decoded_m[:100].strip())
+
+        if "AAAA" in sample_256k or "aaaa" in sample_256k or "BBBB" in sample_256k or "bbbb" in sample_256k:
+            bacon_cands = re.findall(r"\b[ABab]{20,}\b", sample_256k)
+            for bc in set(bacon_cands):
+                for mode, m_label in ((bc.upper(), "Standard"), (bc.upper().replace("A", "X").replace("B", "A").replace("X", "B"), "Inverted")):
+                    dec_b = decode_bacon(mode)
+                    if dec_b:
+                        for pattern in self.flag_patterns:
+                            for match in pattern.finditer(dec_b):
+                                _record_flag(match.group(0).strip(), f"Baconian Cipher ({m_label})", dec_b[:100].strip())
 
         if early_stop and found_flags:
             return found_flags
 
         # 14. ROT13 & ROT18 (ROT13 letters + ROT5 digits)
-        candidate_blocks = re.findall(r"[A-Za-z0-9_]{3,30}\{[^}\n\r\t]{4,100}\}", raw_text)
-        for block in set(candidate_blocks):
-            # Standard Caesar shifts 1-25
-            for shift in range(1, 26):
-                shifted = []
+        if "{" in sample_1mb and "}" in sample_1mb:
+            candidate_blocks = re.findall(r"[A-Za-z0-9_]{3,30}\{[^}\n\r\t]{4,100}\}", sample_1mb)
+            for block in set(candidate_blocks):
+                # Standard Caesar shifts 1-25
+                for shift in range(1, 26):
+                    shifted = []
+                    for c in block:
+                        if 'a' <= c <= 'z':
+                            shifted.append(chr((ord(c) - ord('a') - shift) % 26 + ord('a')))
+                        elif 'A' <= c <= 'Z':
+                            shifted.append(chr((ord(c) - ord('A') - shift) % 26 + ord('A')))
+                        else:
+                            shifted.append(c)
+                    shifted_str = "".join(shifted)
+                    for pattern in self.flag_patterns:
+                        m = pattern.search(shifted_str)
+                        if m:
+                            flag = m.group(0).strip()
+                            _record_flag(flag, f"Caesar/ROT (shift={shift}, raw: {block})", shifted_str)
+
+                # ROT18: ROT13 on letters + ROT5 on digits
+                rot18 = []
                 for c in block:
                     if 'a' <= c <= 'z':
-                        shifted.append(chr((ord(c) - ord('a') - shift) % 26 + ord('a')))
+                        rot18.append(chr((ord(c) - ord('a') - 13) % 26 + ord('a')))
                     elif 'A' <= c <= 'Z':
-                        shifted.append(chr((ord(c) - ord('A') - shift) % 26 + ord('A')))
+                        rot18.append(chr((ord(c) - ord('A') - 13) % 26 + ord('A')))
+                    elif '0' <= c <= '9':
+                        rot18.append(chr((ord(c) - ord('0') - 5) % 10 + ord('0')))
                     else:
-                        shifted.append(c)
-                shifted_str = "".join(shifted)
+                        rot18.append(c)
+                rot18_str = "".join(rot18)
                 for pattern in self.flag_patterns:
-                    m = pattern.search(shifted_str)
+                    m = pattern.search(rot18_str)
                     if m:
                         flag = m.group(0).strip()
-                        _record_flag(flag, f"Caesar/ROT (shift={shift}, raw: {block})", shifted_str)
-
-            # ROT18: ROT13 on letters + ROT5 on digits
-            rot18 = []
-            for c in block:
-                if 'a' <= c <= 'z':
-                    rot18.append(chr((ord(c) - ord('a') - 13) % 26 + ord('a')))
-                elif 'A' <= c <= 'Z':
-                    rot18.append(chr((ord(c) - ord('A') - 13) % 26 + ord('A')))
-                elif '0' <= c <= '9':
-                    rot18.append(chr((ord(c) - ord('0') - 5) % 10 + ord('0')))
-                else:
-                    rot18.append(c)
-            rot18_str = "".join(rot18)
-            for pattern in self.flag_patterns:
-                m = pattern.search(rot18_str)
-                if m:
-                    flag = m.group(0).strip()
-                    _record_flag(flag, f"ROT18 (ROT13+ROT5, raw: {block})", rot18_str)
+                        _record_flag(flag, f"ROT18 (ROT13+ROT5, raw: {block})", rot18_str)
 
         if early_stop and found_flags:
             return found_flags
@@ -477,33 +536,31 @@ class StringHunter:
         if early_stop and found_flags:
             return found_flags
 
-        # 8. Single-byte XOR scan on chunks up to 1MB
-        scan_xor_data = raw_bytes[:1024 * 1024]
-        for key in range(1, 256):
-            xored_prefixes = [bytes(b ^ key for b in p) for p in config.FLAG_PREFIXES]
-            for p_idx, xp in enumerate(xored_prefixes):
-                pos = scan_xor_data.find(xp)
-                if pos != -1:
-                    slice_start = max(0, pos - 20)
-                    slice_end = min(len(scan_xor_data), pos + 200)
-                    decrypted_slice = bytes(b ^ key for b in scan_xor_data[slice_start:slice_end])
-                    dec_str = decrypted_slice.decode("latin-1", errors="ignore")
-                    for pattern in self.flag_patterns:
-                        m = pattern.search(dec_str)
-                        if m:
-                            flag = m.group(0).strip()
-                            _record_flag(flag, f"Single-Byte XOR (key=0x{key:02x})", dec_str[:100].strip())
+        # 8. Single-byte XOR scan using precomputed stems table on chunks up to 256KB
+        scan_xor_data = raw_bytes[:256 * 1024]
+        for key, xp, xored in self._precomputed_xor_table:
+            pos = scan_xor_data.find(xored)
+            if pos != -1:
+                slice_start = max(0, pos - 20)
+                slice_end = min(len(scan_xor_data), pos + 200)
+                decrypted_slice = bytes(b ^ key for b in scan_xor_data[slice_start:slice_end])
+                dec_str = decrypted_slice.decode("latin-1", errors="ignore")
+                for pattern in self.flag_patterns:
+                    m = pattern.search(dec_str)
+                    if m:
+                        flag = m.group(0).strip()
+                        _record_flag(flag, f"Single-Byte XOR (key=0x{key:02x})", dec_str[:100].strip())
 
-        # 15. Multi-byte repeating XOR scan (2, 3, 4 bytes)
-        if not found_flags or not early_stop:
-            rep_flags = self.hunt_repeating_xor_flags(raw_bytes)
+        # 15. Multi-byte repeating XOR scan (2, 3, 4 bytes on small buffers)
+        if len(raw_bytes) <= 32 * 1024 and (not found_flags or not early_stop):
+            rep_flags = self.hunt_repeating_xor_flags(raw_bytes, max_scan_len=32 * 1024)
             for rf in rep_flags:
                 _record_flag(rf["flag"], rf["encoding"], rf["context"])
 
         # 16. Multi-layer Recursive Decoding (Level 2)
         if depth < 1 and not (early_stop and found_flags):
             candidates = [it for it in intermediate_texts if len(it) >= 12 and not any(it == f["flag"] for f in found_flags)]
-            for cand_inter in set(candidates[:15]):
+            for cand_inter in set(candidates[:6]):
                 nested = self.hunt_flags(cand_inter, early_stop=early_stop, on_flag_found=on_flag_found, depth=depth + 1)
                 for nf in nested:
                     _record_flag(nf["flag"], f"Layered [{nf['encoding']}]", nf["context"])
@@ -513,8 +570,8 @@ class StringHunter:
     def hunt_repeating_xor_flags(
         self,
         raw_bytes: bytes,
-        max_scan_len: int = 128 * 1024,
-        key_lens: Tuple[int, ...] = (2, 3, 4)
+        max_scan_len: int = 32 * 1024,
+        key_lens: Tuple[int, ...] = (2, 3)
     ) -> List[Dict[str, str]]:
         """
         Multi-byte repeating XOR flag hunter (VuwCTF, srdnlenCTF pattern):
@@ -523,8 +580,9 @@ class StringHunter:
         results = []
         scan_data = raw_bytes[:max_scan_len]
         data_len = len(scan_data)
+        xor_stems = [b"HackToday", b"sunctf{", b"picoCTF{", b"flag{", b"CTF{"]
 
-        for prefix in config.FLAG_PREFIXES:
+        for prefix in xor_stems:
             p_len = len(prefix)
             for k_len in key_lens:
                 # Require at least 2 bytes of periodicity verification to prevent false positive blowup

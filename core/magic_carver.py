@@ -9,13 +9,17 @@ import bz2
 import lzma
 import os
 import re
+import shutil
 import struct
+import subprocess
 import zipfile
 import zlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
+from core.pdf_inspector import PDFInspector, to_wsl_path
+from core.string_hunter import StringHunter
 
 
 class MagicCarver:
@@ -87,19 +91,26 @@ class MagicCarver:
             }
         return None
 
-    def carve_embedded_files(self, data: bytes, base_name: str = "carved") -> List[Dict[str, Any]]:
-        """Carve embedded files found at non-zero offsets."""
+    def carve_embedded_files(self, data: bytes, base_name: str = "carved", candidate_passwords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Carve embedded files found at non-zero offsets with recursive unpack and PDF triage."""
         carved_files = []
         carve_targets = [
-            ("zip", b"PK\x03\x04", b"PK\x05\x06", 22),  # ZIP header + EOCD (min 22 bytes after EOCD magic)
+            ("zip", b"PK\x03\x04", b"PK\x05\x06", 22),
             ("png", b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82", 8),
             ("jpg", b"\xff\xd8\xff", b"\xff\xd9", 2),
             ("gif", b"GIF89a", b"\x00\x3b", 2),
+            ("pdf", b"%PDF", b"%%EOF", 5),
             ("elf", b"\x7fELF", None, 0),
             ("pcap", b"\xd4\xc3\xb2\xa1", None, 0),
             ("pcapng", b"\n\r\r\n", None, 0),
             ("gz", b"\x1f\x8b\x08", None, 0),
         ]
+
+        hunter = StringHunter()
+        passwords_list = list(candidate_passwords or [])
+        for dp in ["", "bluelobsterislove", "password", "spongebob", "admin", "123456", "CTF", "flag"]:
+            if dp not in passwords_list:
+                passwords_list.append(dp)
 
         for ext, magic, trailer, trailer_extra in carve_targets:
             start_pos = 0
@@ -107,21 +118,21 @@ class MagicCarver:
                 pos = data.find(magic, start_pos)
                 if pos == -1:
                     break
-                
-                # We are looking for embedded files (either at non-zero offset or inside overlay)
+
                 end_pos = None
                 if trailer:
                     t_pos = data.find(trailer, pos + len(magic))
                     if ext == "zip" and len(data) >= t_pos + 22:
                         comment_len = struct.unpack("<H", data[t_pos + 20:t_pos + 22])[0]
                         end_pos = t_pos + 22 + comment_len
-                    else:
+                    elif ext == "pdf" and t_pos != -1:
                         end_pos = t_pos + len(trailer) + trailer_extra
-                    # Cap max size
-                    if end_pos - pos > config.MAX_CARVE_FILE_SIZE:
+                    elif t_pos != -1:
+                        end_pos = t_pos + len(trailer) + trailer_extra
+
+                    if end_pos and end_pos - pos > config.MAX_CARVE_FILE_SIZE:
                         end_pos = pos + config.MAX_CARVE_FILE_SIZE
                 else:
-                    # Generic chunk carving (e.g. 5MB slice if no trailer known)
                     end_pos = min(len(data), pos + 5 * 1024 * 1024)
 
                 if end_pos and end_pos > pos:
@@ -133,36 +144,90 @@ class MagicCarver:
                         with open(carve_path, "wb") as f:
                             f.write(carved_chunk)
 
-                        carved_info = {
+                        carved_info: Dict[str, Any] = {
                             "type": ext.upper(),
                             "offset": pos,
                             "size": len(carved_chunk),
                             "path": carve_path,
-                            "filename": carve_filename
+                            "filename": carve_filename,
+                            "flags_found": []
                         }
 
-                        # If it's a ZIP, inspect file list inside safely
+                        # Hunt flags in the raw carved chunk
+                        for fl in hunter.hunt_flags(carved_chunk):
+                            fl["context"] = f"Carved {ext.upper()} Offset {pos}: {fl.get('context', '')}"
+                            carved_info["flags_found"].append(fl)
+
+                        # If it's a PDF directly, run PDF inspector
+                        if ext == "pdf":
+                            try:
+                                pdf_insp = PDFInspector(self.output_dir)
+                                pdf_res = pdf_insp.inspect(carve_path, passwords_list)
+                                carved_info["flags_found"].extend(pdf_res.get("flags_found", []))
+                            except Exception:
+                                pass
+
+                        # If it's a ZIP, inspect file list inside safely and try extraction
                         if ext == "zip":
+                            extract_sub = os.path.join(self.output_dir, f"{carve_filename}_extracted")
+                            os.makedirs(extract_sub, exist_ok=True)
+                            carved_info["extracted_to"] = extract_sub
+
+                            # 1. Try python zipfile
                             try:
                                 with zipfile.ZipFile(carve_path, "r") as zf:
                                     namelist = zf.namelist()
                                     carved_info["zip_entries"] = namelist
-                                    # Extract safe entries
-                                    extract_sub = os.path.join(self.output_dir, f"{carve_filename}_extracted")
-                                    os.makedirs(extract_sub, exist_ok=True)
                                     for entry in namelist:
-                                        # Protect against Zip Slip
                                         if not os.path.isabs(entry) and ".." not in entry:
                                             try:
                                                 zf.extract(entry, extract_sub)
                                             except Exception:
                                                 pass
-                                    carved_info["extracted_to"] = extract_sub
                             except Exception as ze:
                                 carved_info["zip_error"] = str(ze)
 
+                            # 2. If extraction is empty or incomplete (0-byte files from zipfile password failure), try 7z via WSL or native
+                            incomplete = (
+                                not os.listdir(extract_sub)
+                                or any(os.path.getsize(os.path.join(extract_sub, f)) == 0 for f in os.listdir(extract_sub))
+                            )
+                            if incomplete:
+                                wsl_carve = to_wsl_path(carve_path)
+                                wsl_extract = to_wsl_path(extract_sub)
+                                for pwd in passwords_list:
+                                    try:
+                                        cmd = ["wsl", "-u", "root", "-d", "kali-linux", "7z", "x", f"-p{pwd}", "-y", "-aoa", f"-o{wsl_extract}", wsl_carve]
+                                        res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                                        if "Everything is Ok" in res.stdout:
+                                            carved_info["password_used"] = pwd
+                                            break
+                                    except Exception:
+                                        pass
+
+                            # 3. Scan all extracted files inside the ZIP
+                            for root, _, files in os.walk(extract_sub):
+                                for fn in files:
+                                    fp = os.path.join(root, fn)
+                                    if fn.lower().endswith(".pdf"):
+                                        try:
+                                            pdf_insp = PDFInspector(self.output_dir)
+                                            pdf_res = pdf_insp.inspect(fp, passwords_list)
+                                            carved_info["flags_found"].extend(pdf_res.get("flags_found", []))
+                                        except Exception:
+                                            pass
+                                    else:
+                                        try:
+                                            with open(fp, "rb") as ef:
+                                                e_bytes = ef.read()
+                                            for fl in hunter.hunt_flags(e_bytes):
+                                                fl["source_file"] = fn
+                                                carved_info["flags_found"].append(fl)
+                                        except Exception:
+                                            pass
+
                         carved_files.append(carved_info)
-                    except Exception as e:
+                    except Exception:
                         pass
 
                 start_pos = pos + len(magic)

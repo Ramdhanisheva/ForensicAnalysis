@@ -118,6 +118,37 @@ class ArchiveUnpacker:
         results["archive_type"] = arch_type or "unknown"
 
         if not arch_type:
+            try:
+                from core.pdf_inspector import to_wsl_path
+                wsl_fp = to_wsl_path(filepath)
+                wsl_out = to_wsl_path(out_dest)
+                chk = subprocess.run(
+                    ["wsl", "-u", "root", "-d", "kali-linux", "7z", "l", wsl_fp],
+                    capture_output=True, text=True, timeout=5
+                )
+                if chk.returncode == 0 and "Listing archive:" in chk.stdout:
+                    arch_type = "7z_fallback"
+                    results["archive_type"] = "7z_fallback"
+                    for pwd in passwords_to_try[:50]:
+                        pwd_arg = f"-p{pwd}" if pwd else "-p"
+                        ex_cmd = ["wsl", "-u", "root", "-d", "kali-linux", "7z", "x", pwd_arg, "-y", f"-o{wsl_out}", wsl_fp]
+                        ex_p = subprocess.run(ex_cmd, capture_output=True, text=True, timeout=10)
+                        if "Everything is Ok" in ex_p.stdout or os.listdir(out_dest):
+                            results["success"] = True
+                            results["password_used"] = pwd
+                            for root, _, files in os.walk(out_dest):
+                                for fn in files:
+                                    fp = os.path.join(root, fn)
+                                    results["extracted_files"].append({
+                                        "filename": fn,
+                                        "path": fp,
+                                        "size_bytes": os.path.getsize(fp)
+                                    })
+                            return results
+            except Exception:
+                pass
+
+        if not arch_type:
             results["error"] = "Not a recognized archive format"
             return results
 
@@ -186,9 +217,6 @@ class ArchiveUnpacker:
                                 break
                             except Exception:
                                 continue
-                        if test_pwd is None:
-                            results["error"] = "Encrypted ZIP password not found in dictionary"
-                            return results
                     else:
                         zf.extractall(path=out_dest)
 
@@ -200,10 +228,41 @@ class ArchiveUnpacker:
                                 "path": full_p,
                                 "size_bytes": info.file_size
                             })
-                    results["success"] = True
-                    return results
+                    if results["extracted_files"]:
+                        results["success"] = True
+                        return results
             except Exception as e:
-                results["error"] = f"ZIP extraction error: {e}"
+                pass
+
+            # 7z CLI Fallback for WinZip AES or encrypted ZIPs
+            try:
+                import subprocess
+                from core.pdf_inspector import to_wsl_path
+                wsl_fp = to_wsl_path(filepath)
+                wsl_out = to_wsl_path(out_dest)
+                for pwd in passwords_to_try[:50]:
+                    try:
+                        cmd = ["wsl", "-u", "root", "-d", "kali-linux", "7z", "x", f"-p{pwd}", "-y", f"-o{wsl_out}", wsl_fp]
+                        chk = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                        if "Everything is Ok" in chk.stdout or os.listdir(out_dest):
+                            results["success"] = True
+                            results["password_used"] = pwd
+                            for root, _, files in os.walk(out_dest):
+                                for fn in files:
+                                    fp = os.path.join(root, fn)
+                                    results["extracted_files"].append({
+                                        "filename": fn,
+                                        "path": fp,
+                                        "size_bytes": os.path.getsize(fp)
+                                    })
+                            return results
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if not results["success"]:
+                results["error"] = "ZIP extraction failed with all candidate passwords"
                 return results
 
         # 3. Tar Archives (.tar, .tar.gz, .tar.bz2, .tar.xz)

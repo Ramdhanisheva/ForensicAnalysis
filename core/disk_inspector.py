@@ -190,6 +190,9 @@ class DiskInspector:
         results: Dict[str, Any] = {
             "is_lnk": False,
             "target_path": "",
+            "local_path": "",
+            "relative_path": "",
+            "command_args": "",
             "arguments": "",
             "flags_found": []
         }
@@ -199,7 +202,7 @@ class DiskInspector:
 
         try:
             with open(filepath, "rb") as f:
-                content = f.read(100000)
+                content = f.read(200000)
 
             if content.startswith(b"\x4c\x00\x00\x00\x01\x14\x02\x00"):
                 results["is_lnk"] = True
@@ -209,6 +212,13 @@ class DiskInspector:
                 paths = re.findall(r"([A-Za-z]:\\[^\x00\r\n]{3,200})", text)
                 if paths:
                     results["target_path"] = paths[0]
+                    results["local_path"] = paths[0]
+
+                # Command line args if any
+                args_m = re.findall(r"(?:powershell|cmd|bash|sh|curl|wget|certutil|rundll32|regsvr32)[^\x00\r\n]{2,300}", text, re.I)
+                if args_m:
+                    results["command_args"] = args_m[0]
+                    results["arguments"] = args_m[0]
 
                 for fl in self.string_hunter.hunt_flags(content):
                     fl["encoding"] = f"Windows LNK ({fl['encoding']})"
@@ -218,6 +228,10 @@ class DiskInspector:
             pass
 
         return results
+
+    def parse_lnk_file(self, filepath: str) -> Dict[str, Any]:
+        """Alias for inspect_lnk to ensure compatibility across modules."""
+        return self.inspect_lnk(filepath)
 
     def recover_raid5_missing_disk(
         self,
@@ -442,3 +456,179 @@ class DiskInspector:
                     all_results["flags_found"].append(fl)
 
         return all_results
+
+
+    def parse_mft_records(self, filepath_or_data) -> Dict[str, Any]:
+        """
+        Fast NTFS Master File Table ($MFT) Resident $DATA & $FILE_NAME Parser:
+        - Scans 1024-byte MFT records ('FILE' magic)
+        - Parses resident $DATA (0x80) attributes to carve hidden payloads & flags
+        - Decodes hex strings and base64 streams directly inside resident attributes
+        """
+        results: Dict[str, Any] = {
+            "is_mft": False,
+            "record_count": 0,
+            "resident_data_count": 0,
+            "filenames": [],
+            "flags_found": []
+        }
+        
+        data = None
+        if isinstance(filepath_or_data, str) and os.path.exists(filepath_or_data):
+            try:
+                with open(filepath_or_data, "rb") as f:
+                    data = f.read(250 * 1024 * 1024)  # Read up to 250MB
+            except Exception:
+                return results
+        elif isinstance(filepath_or_data, (bytes, bytearray)):
+            data = bytes(filepath_or_data)
+        else:
+            return results
+
+        if not data or (b"FILE" not in data[:2048] and b"BAAD" not in data[:2048]):
+            return results
+
+        results["is_mft"] = True
+        rec_size = 1024
+        total_recs = len(data) // rec_size
+        results["record_count"] = total_recs
+
+        for i in range(total_recs):
+            offset = i * rec_size
+            rec = data[offset:offset + rec_size]
+            if not rec.startswith(b"FILE"):
+                continue
+
+            # Fast resident keyword & flag scan on record
+            rec_lower = rec.lower()
+            if b"{" in rec or b"flag" in rec_lower or b"ctf" in rec_lower or b"hacktoday" in rec_lower or b"73 75" in rec or b"secret" in rec_lower:
+                try:
+                    attr_offset = struct.unpack_from("<H", rec, 0x14)[0]
+                    pos = attr_offset
+                    while pos < rec_size - 8:
+                        attr_type, attr_len = struct.unpack_from("<II", rec, pos)
+                        if attr_type == 0xFFFFFFFF or attr_len == 0 or pos + attr_len > rec_size:
+                            break
+
+                        # 0x30 = $FILE_NAME
+                        if attr_type == 0x30:
+                            content_offset = struct.unpack_from("<H", rec, pos + 0x14)[0]
+                            fn_data = rec[pos + content_offset:pos + attr_len]
+                            if len(fn_data) >= 66:
+                                fn_len = fn_data[64]
+                                fn_bytes = fn_data[66:66 + fn_len * 2]
+                                try:
+                                    fname = fn_bytes.decode("utf-16le", errors="ignore")
+                                    if fname and not fname.startswith("$"):
+                                        results["filenames"].append(fname)
+                                        if "{" in fname or "flag" in fname.lower() or "ctf" in fname.lower():
+                                            for fl in self.string_hunter.hunt_flags(fname):
+                                                fl["encoding"] = f"MFT FileName ({fl['encoding']})"
+                                                results["flags_found"].append(fl)
+                                except Exception:
+                                    pass
+
+                        # 0x80 = $DATA (Resident)
+                        elif attr_type == 0x80:
+                            non_resident = rec[pos + 8]
+                            if non_resident == 0:  # Resident $DATA
+                                results["resident_data_count"] += 1
+                                c_len, c_off = struct.unpack_from("<IH", rec, pos + 0x10)
+                                content = rec[pos + c_off:pos + c_off + c_len]
+                                if content:
+                                    for fl in self.string_hunter.hunt_flags(content):
+                                        fl["encoding"] = f"MFT Resident $DATA ({fl['encoding']})"
+                                        results["flags_found"].append(fl)
+
+                        pos += attr_len
+                except Exception:
+                    pass
+
+        return results
+
+    def parse_eml_file(self, filepath_or_data) -> Dict[str, Any]:
+        """
+        Email & Phishing Triage Engine (.eml / .msg / RFC 822):
+        - Extracts From, To, Subject, Date headers
+        - Extracts Plaintext and HTML body
+        - Carves base64 attachments (ZIP, LNK, PDF, DOCX, EXE)
+        - Deobfuscates embedded PowerShell / URLs inside body
+        """
+        import email
+        from email import policy
+        results: Dict[str, Any] = {
+            "is_eml": False,
+            "headers": {},
+            "attachments": [],
+            "body_text": "",
+            "flags_found": []
+        }
+
+        raw_bytes = b""
+        if isinstance(filepath_or_data, str) and os.path.exists(filepath_or_data):
+            try:
+                with open(filepath_or_data, "rb") as f:
+                    raw_bytes = f.read(10 * 1024 * 1024)
+            except Exception:
+                return results
+        elif isinstance(filepath_or_data, (bytes, bytearray)):
+            raw_bytes = bytes(filepath_or_data)
+        else:
+            return results
+
+        if not (b"From:" in raw_bytes[:1024] or b"Subject:" in raw_bytes[:1024] or b"MIME-Version:" in raw_bytes[:1024]):
+            return results
+
+        try:
+            msg = email.message_from_bytes(raw_bytes, policy=policy.default)
+            results["is_eml"] = True
+            results["headers"] = {
+                "Subject": str(msg.get("Subject", "")),
+                "From": str(msg.get("From", "")),
+                "To": str(msg.get("To", "")),
+                "Date": str(msg.get("Date", ""))
+            }
+
+            # Scan headers for flags
+            for h_k, h_v in results["headers"].items():
+                for fl in self.string_hunter.hunt_flags(h_v):
+                    fl["encoding"] = f"EML Header {h_k} ({fl['encoding']})"
+                    results["flags_found"].append(fl)
+
+            # Walk through message parts
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                filename = part.get_filename()
+
+                if filename:
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        att_path = os.path.join(self.output_dir, filename)
+                        try:
+                            with open(att_path, "wb") as af:
+                                af.write(payload)
+                        except Exception:
+                            pass
+                        results["attachments"].append({
+                            "filename": filename,
+                            "content_type": content_type,
+                            "size": len(payload),
+                            "path": att_path
+                        })
+                        for fl in self.string_hunter.hunt_flags(payload):
+                            fl["encoding"] = f"EML Attachment {filename} ({fl['encoding']})"
+                            results["flags_found"].append(fl)
+                elif content_type in ("text/plain", "text/html"):
+                    try:
+                        body_content = part.get_content()
+                        results["body_text"] += "\n" + str(body_content)
+                        for fl in self.string_hunter.hunt_flags(str(body_content)):
+                            fl["encoding"] = f"EML Body ({fl['encoding']})"
+                            results["flags_found"].append(fl)
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
+
+        return results
