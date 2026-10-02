@@ -1,4 +1,4 @@
-﻿# Results & Artifacts (generated at runtime, can be huge)
+# Results & Artifacts (generated at runtime, can be huge)
 results/
 extracted_artifacts/
 
@@ -37,3 +37,8 @@ Thumbs.db
 # Temp
 *.tmp
 *.bak
+fixed_magic.png
+repaired_flag.png
+totallylegit.zip
+test_unp/
+test_carve_conv/
