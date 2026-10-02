@@ -435,16 +435,19 @@ class MemoryStreamer:
                                 "executed_commands": []
                             }
 
-                        if "wp-login.php" in url_path or "login" in url_path.lower():
+                        # Generalized Login Tracking (WordPress, Joomla, Drupal, Laravel, Tomcat, etc.)
+                        if any(term in url_path.lower() for term in ("wp-login.php", "login", "signin", "auth", "administrator", "session", "user/login")):
                             if method == "POST":
                                 results["web_ir_killchain"]["failed_logins"] += 1
                                 results["web_ir_killchain"]["attacker_ips"][ip_str] = results["web_ir_killchain"]["attacker_ips"].get(ip_str, 0) + 1
 
-                        if "admin-ajax.php" in url_path or "xmlrpc.php" in url_path:
+                        # Generalized Exploited CMS / Framework Endpoints
+                        if any(term in url_path.lower() for term in ("admin-ajax.php", "xmlrpc.php", "rest_route", "cgi-bin", "actuator", "invoker", "api/v", "wp-json")):
                             results["web_ir_killchain"]["exploited_endpoints"].add(url_path)
 
-                        if "plugins" in url_path or "uploads" in url_path:
-                            if ".php" in url_path:
+                        # Generalized Webshell Detection (.php, .phtml, .jsp, .asp, .cgi in writable dirs)
+                        if any(ext in url_path.lower() for ext in (".php", ".phtml", ".jsp", ".asp", ".aspx", ".cgi", ".sh")):
+                            if any(d in url_path.lower() for d in ("plugins", "uploads", "themes", "tmp", "var", "cache", "images", "media", "public")):
                                 results["web_ir_killchain"]["webshells"].add(url_path)
 
                     host_matches = re.finditer(rb"(?:^|[\r\n\x00\s])Host:\s*([a-zA-Z0-9_\-\.]+)", current_buffer, re.IGNORECASE)
@@ -480,7 +483,7 @@ class MemoryStreamer:
                             }
                         results["web_ir_killchain"]["cve_mentions"].add(cve_str)
 
-                    ws_exec_matches = re.finditer(rb"(?:shell_exec|system|passthru|eval)\s*\(\s*\$_(?:REQUEST|GET|POST)\[['\"]([a-zA-Z0-9_\-]+)['\"]\]", current_buffer)
+                    ws_exec_matches = re.finditer(rb"(?:shell_exec|system|passthru|eval|popen|exec)\s*\(\s*\$_(?:REQUEST|GET|POST)\[['\"]([a-zA-Z0-9_\-]+)['\"]\]", current_buffer)
                     for wsm in ws_exec_matches:
                         param = wsm.group(1).decode("ascii", errors="ignore")
                         if "web_ir_killchain" not in results:
@@ -500,7 +503,9 @@ class MemoryStreamer:
                     for pcm in param_call_matches:
                         p_name = pcm.group(1).decode("ascii", errors="ignore")
                         p_cmd = pcm.group(2).decode("ascii", errors="ignore")
-                        if p_name in ("wpc_diag", "cmd", "exec", "c", "shell", "run") or p_cmd in ("id", "whoami", "uname", "ls", "cat"):
+                        sus_params = ("wpc_diag", "cmd", "exec", "c", "shell", "run", "command", "system", "code", "eval", "diag")
+                        sus_cmds = ("id", "whoami", "uname", "ls", "cat", "dir", "pwd", "hostname", "ipconfig", "ifconfig", "curl", "wget", "nc", "bash", "sh", "net", "env")
+                        if p_name in sus_params or p_cmd in sus_cmds:
                             if "web_ir_killchain" not in results:
                                 results["web_ir_killchain"] = {
                                     "target_hosts": set(),

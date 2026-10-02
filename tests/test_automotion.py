@@ -6,6 +6,7 @@ PcapAnalyzer, AD1Parser, and MemoryStreamer against synthetic CTF challenge arti
 
 import base64
 import bz2
+import hashlib
 import os
 import shutil
 import struct
@@ -861,7 +862,95 @@ class TestAutomotionForensics(unittest.TestCase):
         # Verify final flag
         self.assertTrue(any("HackToday26{c0ngr444444tzzzz_y0u_f0und_th3_gh0st_1n_th3_fl4sh_1_gu3sssss}" in fl["flag"] for fl in res.get("flags_found", [])))
 
+    def test_generalized_n_part_kape_synthesis(self):
+        """
+        Verify that multi-part flag synthesis works dynamically for arbitrary N-parts (e.g. 2-part, 4-part),
+        different parameter names, and varied encoding wrappers without hardcoding.
+        """
+        # Create a mock 4-part triage directory
+        triage_dir = os.path.join(self.test_dir, "kape_4part_triage")
+        os.makedirs(triage_dir, exist_ok=True)
+
+        # Part 1: USN Journal with custom part marker (part 1 of 4)
+        p1_val = "HackToday26{dyn4m1c_"
+        p1_b64 = base64.b64encode(p1_val.encode()).decode()
+        usn_content = f"record_header_PART1OF4__{p1_b64}.tmp_record_trailer".encode()
+        with open(os.path.join(triage_dir, "$J"), "wb") as f:
+            f.write(usn_content)
+
+        # Part 2: Registry RunMRU with 'part 2/4'
+        reg_dir = os.path.join(triage_dir, "Windows", "System32", "config")
+        os.makedirs(reg_dir, exist_ok=True)
+        hive_content = b"header_cmd /c echo p4rt2_is_c00l_ & rem (part 2/4)_trailer"
+        with open(os.path.join(reg_dir, "NTUSER.DAT"), "wb") as f:
+            f.write(hive_content)
+
+        # Part 3: Scheduled task with 'part 3/4'
+        tasks_dir = os.path.join(triage_dir, "Windows", "System32", "Tasks")
+        os.makedirs(tasks_dir, exist_ok=True)
+        xml_script = 'Write-Output "part 3/4: n_p4rts_w0rk1ng_"'
+        enc_utf16 = base64.b64encode(xml_script.encode("utf-16le")).decode()
+        xml_content = f'<Task><Exec><Command>powershell.exe</Command><Arguments>-EncodedCommand {enc_utf16}</Arguments></Exec></Task>'
+        with open(os.path.join(tasks_dir, "CleanupTask.xml"), "w", encoding="utf-8") as f:
+            f.write(xml_content)
+
+        # Part 4: Registry RunMRU with 'part 4/4'
+        hive_content_4 = b"header_set FLAG_CHUNK=g3n3r1c_s0lv3r} & rem (part 4/4)_trailer"
+        with open(os.path.join(reg_dir, "SOFTWARE"), "wb") as f:
+            f.write(hive_content_4)
+
+        res = self.sys.inspect_kape_triage(triage_dir)
+        flags = [f["flag"] for f in res.get("flags_found", [])]
+        self.assertTrue(any("HackToday26{dyn4m1c_p4rt2_is_c00l_n_p4rts_w0rk1ng_g3n3r1c_s0lv3r}" in fl for fl in flags))
+
+    def test_generalized_esp32_crypto_variations(self):
+        """
+        Verify ESP32 engine dynamically handles different key types (plaintext, repeating XOR, single-byte XOR)
+        and non-40-character arbitrary fragment lengths.
+        """
+        # Create minimal flash
+        flash = bytearray(0x200100)
+        entry = struct.pack("<2sBBII16sI", b"\xaa\x50", 0x01, 0x02, 0x9000, 0x6000, b"nvs", 0)
+        flash[0x8000:0x8020] = entry
+
+        # Key in plaintext config: secret_token=m3g4_s3cr3t_2026
+        key = b"m3g4_s3cr3t_2026"
+        cfg_str = b"secret_token=" + key
+        flash[0x85000:0x85000+len(cfg_str)] = cfg_str
+
+        # Generate a test payload with non-40-byte Base64 fragments
+        # Secret message: 'fl4sh_dyn4m1c_p_succ3ss' (length 23 chars)
+        secret = b"fl4sh_dyn4m1c_p_succ3ss"
+        # Encrypt with continuous SHA-256 keystream counter 0 big endian
+        keystream = bytearray()
+        cnt = 0
+        while len(keystream) < len(secret):
+            keystream.extend(hashlib.sha256(key + cnt.to_bytes(4, "big")).digest())
+            cnt += 1
+        ct = bytes([c ^ k for c, k in zip(secret, keystream[:len(secret)])])
+        ct_b64 = base64.b64encode(ct).decode()
+
+        # Split ct_b64 into 2 custom-sized pieces (not 40 bytes!)
+        mid = len(ct_b64) // 2
+        p1 = ct_b64[:mid].encode()
+        p2 = ct_b64[mid:].encode()
+
+        # Put p1 in NVS as 'chunk_a'
+        flash[0x9500:0x9500+len(b"chunk_a\x00\x00\x00")] = b"chunk_a\x00\x00\x00"
+        flash[0x9510:0x9510+len(p1)] = p1
+
+        # Put p2 in slack space
+        flash[0x180000:0x180000+len(p2)] = p2
+
+        res = self.esp.inspect_flash_dump(bytes(flash))
+        # Verify recovered key
+        self.assertTrue(any("m3g4_s3cr3t_2026" in k["deobfuscated_key"] for k in res.get("recovered_keys", [])))
+        # Verify dynamic flag found
+        flags = [f["flag"] for f in res.get("flags_found", [])]
+        self.assertTrue(any("fl4sh_dyn4m1c_p_succ3ss" in fl for fl in flags))
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

@@ -501,16 +501,21 @@ class SystemInspector:
                             fl["encoding"] = f"Registry Hive ({fl['encoding']})"
                             results["flags_found"].append(fl)
 
-                        # Check RunMRU commands: cmd /c echo ... & rem (part X/Y)
-                        runmru_matches = re.finditer(rb"(?:cmd(?:\.exe)?\s+/c\s+echo\s+([^\s\r\n\x00>]+)[^\r\n\x00]*rem\s+\(part\s*(\d+)/(\d+)\))", hive_bytes, re.IGNORECASE)
+                        # Check RunMRU commands: cmd /c echo ... & rem (part X/Y) or similar execution history
+                        runmru_matches = re.finditer(
+                            rb"(?:(?:cmd(?:\.exe)?\s+/c\s+echo|echo|set\s+[a-zA-Z0-9_]+\s*=)\s*([^\s\r\n\x00>&]+)[^\r\n\x00]*(?:rem|::|#|//|\b)(?:\(?part|frag|chunk|p)[_\s]*(\d+)(?:\s*(?:/|of)\s*(\d+))?\)?)",
+                            hive_bytes,
+                            re.IGNORECASE
+                        )
                         for rm in runmru_matches:
                             val = rm.group(1).decode("latin-1", errors="ignore").strip()
-                            p_idx = int(rm.group(2))
-                            p_tot = int(rm.group(3))
+                            p_idx = int(rm.group(2)) if rm.group(2) else 1
+                            p_tot = int(rm.group(3)) if rm.group(3) else 0
+                            tot_str = f"/{p_tot}" if p_tot else ""
                             results["flags_found"].append({
                                 "flag": val,
-                                "encoding": f"Registry RunMRU (part {p_idx}/{p_tot})",
-                                "context": f"Part {p_idx} of {p_tot} from {file}"
+                                "encoding": f"Registry RunMRU (part {p_idx}{tot_str})",
+                                "context": f"Part {p_idx} from Registry {file}: {val}"
                             })
                     except Exception:
                         pass
@@ -521,20 +526,38 @@ class SystemInspector:
                     try:
                         with open(f_path, "rb") as f:
                             usn_bytes = f.read(50 * 1024 * 1024)
-                        # Search for temporary files with Base64 names (e.g. PART1OF3__SGFja1RvZGF5MjZ7...tmp)
-                        usn_matches = re.finditer(rb"(?:PART(\d+)OF(\d+)__)?([A-Za-z0-9+/=]{16,64})\.(?:tmp|dat|bin|ps1)", usn_bytes)
+                        # Dynamic pattern for transient files with Base64 / Hex names and optional part markers
+                        usn_matches = re.finditer(
+                            rb"(?:(?:PART|part|frag|chunk|p)[_\s]*(\d+)(?:(?:OF|of|_|/)(\d+))?_+)?([A-Za-z0-9+/]{12,}={0,2})\.(?:[a-zA-Z0-9]{1,5})",
+                            usn_bytes,
+                            re.IGNORECASE
+                        )
                         for um in usn_matches:
                             p_idx = int(um.group(1)) if um.group(1) else 1
-                            p_tot = int(um.group(2)) if um.group(2) else 3
+                            p_tot = int(um.group(2)) if um.group(2) else 0
                             b64_name = um.group(3).decode("latin-1", errors="ignore")
+                            tot_str = f"/{p_tot}" if p_tot else ""
+                            # Try Base64 decode
                             try:
                                 pad = (4 - len(b64_name) % 4) % 4
                                 dec_name = base64.b64decode((b64_name + "=" * pad).encode("ascii")).decode("latin-1", errors="ignore")
-                                results["flags_found"].append({
-                                    "flag": dec_name,
-                                    "encoding": f"USN Journal $J Base64 (part {p_idx}/{p_tot})",
-                                    "context": f"Decoded filename: {b64_name}.tmp -> {dec_name}"
-                                })
+                                if any(c.isalnum() for c in dec_name):
+                                    results["flags_found"].append({
+                                        "flag": dec_name,
+                                        "encoding": f"USN Journal $J Base64 (part {p_idx}{tot_str})",
+                                        "context": f"Decoded filename: {b64_name} -> {dec_name}"
+                                    })
+                            except Exception:
+                                pass
+                            # Try Hex decode
+                            try:
+                                dec_hex = bytes.fromhex(b64_name).decode("latin-1", errors="ignore")
+                                if any(c.isalnum() for c in dec_hex):
+                                    results["flags_found"].append({
+                                        "flag": dec_hex,
+                                        "encoding": f"USN Journal $J Hex (part {p_idx}{tot_str})",
+                                        "context": f"Hex filename: {b64_name} -> {dec_hex}"
+                                    })
                             except Exception:
                                 pass
                     except Exception:
@@ -545,8 +568,8 @@ class SystemInspector:
                     try:
                         with open(f_path, "rb") as f:
                             task_bytes = f.read(2 * 1024 * 1024)
-                        # Extract -EncodedCommand
-                        enc_matches = re.finditer(rb"(?:-enc|-encodedcommand)\s+([A-Za-z0-9+/=]{16,})", task_bytes, re.IGNORECASE)
+                        # Extract -EncodedCommand (-enc, -ec, -encodedcommand)
+                        enc_matches = re.finditer(rb"(?:-enc|-ec|-encodedcommand)\s+([A-Za-z0-9+/=]{16,})", task_bytes, re.IGNORECASE)
                         for em in enc_matches:
                             b64_val = em.group(1).decode("ascii", errors="ignore")
                             try:
@@ -557,38 +580,53 @@ class SystemInspector:
                                     fl["context"] = f"Task {file}: {fl['context']}"
                                     results["flags_found"].append(fl)
 
-                                # Extract (part X/Y) from comments or commands
-                                m_part = re.search(r"\(part\s*(\d+)/(\d+)\)\s*([A-Za-z0-9_\-\{\}\!@#\$%\^&\*\+=~`]+)", dec_cmd, re.IGNORECASE)
+                                # Extract (part X/Y) or part X from comments or commands
+                                m_part = re.search(r"(?:part|frag|chunk|p)[_\s]*(\d+)(?:\s*(?:/|of)\s*(\d+))?[_\s\)\:]*([A-Za-z0-9_\-\{\}\!@#\$%\^&\*\+=~`]+)", dec_cmd, re.IGNORECASE)
                                 if m_part:
                                     p_idx = int(m_part.group(1))
-                                    p_tot = int(m_part.group(2))
+                                    p_tot = int(m_part.group(2)) if m_part.group(2) else 0
                                     p_val = m_part.group(3).strip()
+                                    tot_str = f"/{p_tot}" if p_tot else ""
                                     results["flags_found"].append({
                                         "flag": p_val,
-                                        "encoding": f"Scheduled Task Script (part {p_idx}/{p_tot})",
-                                        "context": f"Part {p_idx} of {p_tot} from Task {file}"
+                                        "encoding": f"Scheduled Task Script (part {p_idx}{tot_str})",
+                                        "context": f"Part {p_idx} from Task {file}: {p_val}"
                                     })
                             except Exception:
                                 pass
                     except Exception:
                         pass
 
-        # 6. Multi-Part Flag Synthesis (Assemble part 1 + part 2 + part 3)
+        # 6. Generalized Multi-Part Flag Synthesis (N-Part Assembly)
         parts_collected: Dict[int, str] = {}
         for fl in results["flags_found"]:
-            m_p = re.search(r"\(part\s*(\d+)/(\d+)\)", fl.get("encoding", "") + " " + fl.get("context", ""))
+            text_context = fl.get("encoding", "") + " " + fl.get("context", "")
+            m_p = re.search(r"(?:part|p|frag|chunk)[_\s]*(\d+)(?:\s*(?:/|of)\s*(\d+))?", text_context, re.IGNORECASE)
             if m_p:
                 idx = int(m_p.group(1))
-                parts_collected[idx] = fl.get("flag", "").strip()
+                val = fl.get("flag", "").strip()
+                if val and idx not in parts_collected:
+                    parts_collected[idx] = val
 
-        if len(parts_collected) >= 3 and 1 in parts_collected and 2 in parts_collected and 3 in parts_collected:
-            assembled_flag = parts_collected[1] + parts_collected[2] + parts_collected[3]
-            if self.string_hunter.is_valid_flag(assembled_flag):
-                results["flags_found"].insert(0, {
-                    "flag": assembled_flag,
-                    "encoding": "Synthesized 3-Part Flag (USN Journal + Registry + Scheduled Task)",
-                    "context": f"Combined: {parts_collected[1]} + {parts_collected[2]} + {parts_collected[3]}"
-                })
+        if len(parts_collected) >= 2:
+            max_idx = max(parts_collected.keys())
+            if all(i in parts_collected for i in range(1, max_idx + 1)):
+                raw_combined = "".join(parts_collected[i] for i in range(1, max_idx + 1))
+                candidates = [
+                    raw_combined,
+                    f"HackToday26{{{raw_combined}}}",
+                    f"flag{{{raw_combined}}}",
+                    f"HackToday{{{raw_combined}}}",
+                    f"CTF{{{raw_combined}}}"
+                ]
+                for cand in candidates:
+                    if self.string_hunter.is_valid_flag(cand):
+                        results["flags_found"].insert(0, {
+                            "flag": cand,
+                            "encoding": f"Synthesized {max_idx}-Part Flag (KAPE Artifacts)",
+                            "context": f"Combined {max_idx} parts: " + " + ".join(f"p{i}='{parts_collected[i]}'" for i in range(1, max_idx + 1))
+                        })
+                        break
 
         return results
 
