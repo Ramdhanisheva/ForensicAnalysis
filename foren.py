@@ -1054,13 +1054,32 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: O
                 os.rmdir(target_out_dir)
             except Exception:
                 pass
-    print()
+
+    out_dir_abs = os.path.abspath(target_out_dir)
+    if all_discovered_flags:
+        print("\n\033[1;42;37m" + "=" * 70 + "\033[0m")
+        print("\033[1;42;37m" + f"  🚩 [BINGO!] TOTAL FLAG DITEMUKAN: {len(all_discovered_flags)}".ljust(68) + "\033[0m")
+        for idx, fl in enumerate(all_discovered_flags, 1):
+            print(f"\033[1;42;30m   [{idx}] FLAG  : {fl.get('flag')} \033[0m")
+            print(f"\033[1;42;30m       METODE: {fl.get('encoding', 'Plaintext')} \033[0m")
+        print(f"\033[1;42;30m   📂 FOLDER HASIL LENGKAP: {out_dir_abs} \033[0m")
+        print("\033[1;42;37m" + "  👉 SILAKAN CEK HASIL DI ATAS & SUBMIT KE SCOREBOARD!".ljust(68) + "\033[0m")
+        print("\033[1;42;37m" + "=" * 70 + "\033[0m\n")
+    else:
+        print("\n\033[1;44;37m" + "=" * 70 + "\033[0m")
+        print("\033[1;44;37m" + "  🔍 [SELESAI] ANALISIS FORENSIK SELESAI".ljust(68) + "\033[0m")
+        print(f"\033[1;44;30m   📂 FOLDER ARTEFAK / HASIL: {out_dir_abs} \033[0m")
+        if saved_artifacts:
+            print(f"\033[1;44;30m   📦 {len(saved_artifacts)} file artefak berhasil diekstrak! \033[0m")
+        print("\033[1;44;37m" + "  👉 SILAKAN BUKA & PERIKSA FOLDER HASIL DI ATAS!".ljust(68) + "\033[0m")
+        print("\033[1;44;37m" + "=" * 70 + "\033[0m\n")
 
     return {
         "target_file": file_path,
         "all_flags": all_discovered_flags,
         "saved_artifacts": saved_artifacts
     }
+
 
 
 def main():
