@@ -48,7 +48,8 @@ Jika jenis soal sudah diketahui, gunakan script langsung yang singkat:
 | **Peripheral Hunter** | `core/peripheral_hunter.py` | Rekonstruksi USB Mouse / Drawing tablet ke file vektor SVG. Decoding Caps Lock LED blink ke kode Morse dan teks. |
 | **Memory Streamer** | `core/memory_streamer.py` | Streaming engine sliding-window 32MB untuk LiME dan Windows dump. Ekstraksi banner kernel Linux, riwayat bash, environment variables, dan visual inspection raw framebuffer bitmap. |
 | **Database Inspector** | `core/db_inspector.py` | SQLite v3 parser: enumerasi tabel, pencarian kolom rahasia, ekstraksi riwayat browser & cookies, carving unallocated page slack, serta rekonstruksi diff edit history. |
-| **System Inspector** | `core/system_inspector.py` | Triage Windows Event Log (`.evtx`) Event ID 4104/4688/1102, decode Base64 PowerShell `-EncodedCommand`. Parser Linux `input_event` keylogger struct, KAPE triage, dan NTFS `$MFT` resident data carving. |
+| **ESP32 & IoT Inspector** | `core/esp32_inspector.py` | ESP32 Flash Memory & NVS Forensics (HackToday 'Durrr Intern'): parser tabel partisi ESP-IDF (magic `\xaa\x50`), NVS extraction, filter decoy flag, 0x80 XOR key recovery, continuous keystream SHA-256 counter mode decryptor, serta carving slack space Base64. |
+| **System Inspector** | `core/system_inspector.py` | Triage Windows Event Log (`.evtx`) Event ID 4104/4688/1102, decode Base64 PowerShell `-EncodedCommand`. Parser USN Journal `$J` multi-part file synthesis (HackToday 'Alice in DFIRland'), Registry `RunMRU`, Scheduled Tasks XML, Linux `input_event` keylogger struct, KAPE triage, dan NTFS `$MFT` resident data carving. |
 | **Disk Inspector** | `core/disk_inspector.py` | Decoding data GPT partition GUID (bzip2/gzip/zlib/ASCII85), rekonstruksi missing disk RAID 5 via streaming XOR, deteksi VMDK sparse & snapshot APFS, parser Recycle Bin `$I` / `$R`, LNK, dan Prefetch. |
 | **Signals & Stego** | `core/signal_engine.py` | Decoder audio DTMF tone (Goertzel murni Python), parser radio Flipper Zero `.sub`, carving komentar & toolpath 3D printing G-code. |
 | **Stego Engine** | `core/stego_engine.py` | Audit chunk PNG, auto-repair tinggi gambar via CRC brute-force, bitplane extraction LSB 0-2, RGB parity, JPEG DQT LSB table markers, dan PNG PLTE slack. |
@@ -75,7 +76,7 @@ Jalankan battery test untuk memastikan seluruh engine berfungsi normal:
 ```bash
 python -m unittest discover tests
 ```
-Semua 34 unit test mencakup seluruh skenario penanganan format file, steganografi, network, dan ekstraksi memori RAM.
+Semua 37 unit test mencakup seluruh skenario penanganan format file, steganografi, network, triage KAPE/USN Journal, WordPress IR kill-chain memory analysis, ESP32 IoT flash dump, dan ekstraksi memori RAM.
 
 ### 2. PCAP Benchmark & Trainer (10 Skenario CTF Nyata)
 Simulasi dan benchmark otomatis 10 soal network forensics dari HackToday, IPB, PicoCTF, dan kompetisi nasional:

@@ -22,6 +22,7 @@ from core.ad1_parser import AD1Parser
 from core.archive_unpacker import ArchiveUnpacker
 from core.db_inspector import DBInspector
 from core.disk_inspector import DiskInspector
+from core.esp32_inspector import ESP32Inspector
 from core.exif_inspector import ExifInspector
 from core.magic_carver import MagicCarver
 from core.memory_streamer import MemoryStreamer
@@ -50,6 +51,7 @@ class TestAutomotionForensics(unittest.TestCase):
         self.disk = DiskInspector(output_dir=self.test_dir)
         self.signal = SignalEngine(output_dir=self.test_dir)
         self.peripheral = PeripheralHunter(output_dir=self.test_dir)
+        self.esp = ESP32Inspector(output_dir=self.test_dir)
 
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
@@ -739,7 +741,127 @@ class TestAutomotionForensics(unittest.TestCase):
         self.assertTrue(any("HackToday26{lkm_rootkit_carved_from_ram}" in fl["flag"] for fl in res.get("flags_found", [])))
         self.assertTrue(any("LKM/Relocatable" in ce["type"] for ce in res.get("carved_elfs", [])))
 
+    def test_hacktoday_alice_in_dfirland_triage(self):
+        """
+        Test HackToday 2026 'Alice in DFIRland' KAPE Triage:
+        - Part 1 in USN Journal ($J): PART1OF3__SGFja1RvZGF5MjZ7ZGZpcl9lenB6X3Nvcmlf.tmp
+        - Part 2 in Registry (NTUSER.DAT): cmd /c echo lagi_sibuk_jadi_ > NUL & rem (part 2/3)\1
+        - Part 3 in Scheduled Task (UA2.xml): -EncodedCommand ... # (part 3/3) simpel_aja_ya}
+        - Result: HackToday26{dfir_ezpz_sori_lagi_sibuk_jadi_simpel_aja_ya}
+        """
+        kape_dir = os.path.join(self.test_dir, "kape_triage")
+        os.makedirs(os.path.join(kape_dir, "$Extend"), exist_ok=True)
+        os.makedirs(os.path.join(kape_dir, "Users", "alice"), exist_ok=True)
+        os.makedirs(os.path.join(kape_dir, "Windows", "System32", "Tasks"), exist_ok=True)
+
+        # 1. USN Journal ($J)
+        usn_content = b"\x00" * 128 + b"PART1OF3__SGFja1RvZGF5MjZ7ZGZpcl9lenB6X3Nvcmlf.tmp\x00"
+        with open(os.path.join(kape_dir, "$Extend", "$J"), "wb") as f:
+            f.write(usn_content)
+
+        # 2. NTUSER.DAT (Registry RunMRU)
+        reg_content = b"\x00" * 64 + b"cmd /c echo lagi_sibuk_jadi_ > NUL & rem (part 2/3)\\1\x00"
+        with open(os.path.join(kape_dir, "Users", "alice", "NTUSER.DAT"), "wb") as f:
+            f.write(reg_content)
+
+        # 3. Scheduled Task UA2.xml with -EncodedCommand
+        p3_cmd = 'New-Item -ItemType File -Force | Out-Null # (part 3/3) simpel_aja_ya}'
+        p3_b64 = base64.b64encode(p3_cmd.encode("utf-16le")).decode("ascii")
+        task_xml = f"""<Task version="1.2">
+  <Actions>
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand {p3_b64}</Arguments>
+    </Exec>
+  </Actions>
+</Task>"""
+        with open(os.path.join(kape_dir, "Windows", "System32", "Tasks", "UA2.xml"), "w", encoding="utf-8") as f:
+            f.write(task_xml)
+
+        res = self.sys.inspect_kape_triage_folder(kape_dir)
+        self.assertTrue(any("HackToday26{dfir_ezpz_sori_lagi_sibuk_jadi_simpel_aja_ya}" in fl["flag"] for fl in res.get("flags_found", [])))
+
+    def test_hacktoday_word_di_press_killchain(self):
+        """
+        Test HackToday 2026 'Word di Press' Linux Memory Dump IR Kill-Chain:
+        - Target Host: wordpress.local
+        - 43 failed POST /wp-login.php attempts from 192.168.1.3
+        - Avada theme CVE-2026-18431 exploit via admin-ajax.php
+        - Webshell wp-performance-cache.php with parameter wpc_diag executing id
+        """
+        log_sample = bytearray()
+        log_sample.extend(b"Host: wordpress.local\r\n")
+        # 43 failed login attempts
+        for _ in range(43):
+            log_sample.extend(b'192.168.1.3 - - [11/Sep/2026:17:47:03 +0700] "POST /wp-login.php HTTP/1.1" 200 6591\n')
+        # Exploit
+        log_sample.extend(b'192.168.1.3 - - [11/Sep/2026:17:47:50 +0700] "POST /wp-admin/admin-ajax.php HTTP/1.1" 200 120\n')
+        log_sample.extend(b"Avada theme CVE-2026-18431 unauthenticated RCE exploit\n")
+        # Webshell
+        log_sample.extend(b'192.168.1.3 - - [11/Sep/2026:17:48:00 +0700] "GET /wp-content/plugins/wp-performance-cache/wp-performance-cache.php?wpc_diag=id HTTP/1.1" 200 50\n')
+        log_sample.extend(b"echo shell_exec($_REQUEST['wpc_diag']);\n")
+
+        lime_path = os.path.join(self.test_dir, "wordpress.lime")
+        with open(lime_path, "wb") as f:
+            f.write(struct.pack("<IIQQQ", 0x4C694D45, 1, 0, len(log_sample) - 1, 0) + bytes(log_sample))
+
+        res = self.mem.scan_memory_dump(lime_path)
+        wk = res.get("web_ir_killchain", {})
+        self.assertIn("wordpress.local", wk.get("target_hosts", []))
+        self.assertEqual(wk.get("failed_logins"), 43)
+        self.assertIn("192.168.1.3", wk.get("attacker_ips", {}))
+        self.assertIn("CVE-2026-18431", wk.get("cve_mentions", []))
+        self.assertIn("wpc_diag", wk.get("rce_parameters", []))
+        self.assertIn("id", wk.get("executed_commands", []))
+
+    def test_hacktoday_durrr_intern_esp32(self):
+        """
+        Test HackToday 2026 'Durrr Intern' ESP32 Flash Memory Forensics:
+        - Partition table at 0x8000
+        - Decoy flag filtered
+        - p1 in NVS, p2 in slack space (2MB)
+        - Deobfuscate key XOR 0x80 -> gh0st_k3y_2026
+        - Continuous SHA-256 counter keystream decryption
+        """
+        # Create minimal 2.1 MB mock flash
+        flash = bytearray(0x200100)
+
+        # 1. ESP-IDF Partition table at 0x8000
+        # nvs: offset 0x9000, size 0x6000 (32 bytes per partition entry)
+        nvs_entry = struct.pack("<2sBBII16sI", b"\xaa\x50", 0x01, 0x02, 0x9000, 0x6000, b"nvs", 0)
+        flash[0x8000:0x8020] = nvs_entry
+
+        # 2. Decoy flag in NVS
+        decoy = b"HackToday26{1f_y0u_4r3_hum4n_just_l3t_1t_b3}"
+        flash[0x98e0:0x98e0+len(decoy)] = decoy
+
+        # 3. Fragment 1 (blob_p1) in NVS
+        p1 = b"QxCCNDMwukMpBqLIcilAw1wNPfbtUqygms4jYOsh"
+        flash[0x97a0:0x97a0+12] = b"blob_p1\x00\x00\x00\x00\x00"
+        flash[0x97bf:0x97bf+len(p1)] = p1
+
+        # 4. Fragment 2 (p2) in slack space at 2 MB (0x200000)
+        p2 = b"Oxqp4YfVyM5gFFg2N34M/CMW4CQ0jnifF7tuRTqX"
+        flash[0x200000:0x200000+len(p2)] = p2
+
+        # 5. Obfuscated key: device_cfg=\xe7\xe8... (XOR 0x80 -> gh0st_k3y_2026)
+        raw_key = bytes.fromhex("e7e8b0f3f4dfebb3f9dfb2b0b2b6")
+        cfg_str = b"device_cfg=" + raw_key
+        flash[0x89ff0:0x89ff0+len(cfg_str)] = cfg_str
+
+        flash_path = os.path.join(self.test_dir, "flash_dump.bin")
+        with open(flash_path, "wb") as f:
+            f.write(flash)
+
+        res = self.esp.inspect_flash_dump(flash_path)
+        # Verify decoy is identified
+        self.assertTrue(any("just_l3t_1t_b3" in df["flag"] or "just_let_it_be" in df["flag"] for df in res.get("decoy_flags", [])))
+        # Verify recovered key
+        self.assertTrue(any(k["deobfuscated_key"] == "gh0st_k3y_2026" for k in res.get("recovered_keys", [])))
+        # Verify final flag
+        self.assertTrue(any("HackToday26{c0ngr444444tzzzz_y0u_f0und_th3_gh0st_1n_th3_fl4sh_1_gu3sssss}" in fl["flag"] for fl in res.get("flags_found", [])))
 
 
 if __name__ == "__main__":
     unittest.main()
+

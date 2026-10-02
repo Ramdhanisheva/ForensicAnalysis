@@ -428,9 +428,14 @@ class SystemInspector:
         return results
 
     def inspect_kape_triage(self, triage_dir: str) -> Dict[str, Any]:
+        """Windows KAPE Triage Analysis."""
+        return self._inspect_kape_triage_impl(triage_dir)
+
+    inspect_kape_triage_folder = inspect_kape_triage
+
+    def _inspect_kape_triage_impl(self, triage_dir: str) -> Dict[str, Any]:
         """
-        Windows KAPE Triage Analysis (UTCTF 2026 pattern):
-        - Traverses collected Windows forensic artifacts directory
+        Windows KAPE Triage Analysis:
         - PowerShell history (ConsoleHost_history.txt)
         - $MFT resident files and deleted data
         - Execution timeline (Amcache.hve)
@@ -490,12 +495,100 @@ class SystemInspector:
                     results["registry_hives_found"].append(file)
                     try:
                         with open(f_path, "rb") as f:
-                            hive_bytes = f.read(10 * 1024 * 1024)
+                            hive_bytes = f.read(20 * 1024 * 1024)
                         for fl in self.string_hunter.hunt_flags(hive_bytes):
                             fl["context"] = f"[Registry {file}] {fl['context']}"
                             fl["encoding"] = f"Registry Hive ({fl['encoding']})"
                             results["flags_found"].append(fl)
+
+                        # Check RunMRU commands: cmd /c echo ... & rem (part X/Y)
+                        runmru_matches = re.finditer(rb"(?:cmd(?:\.exe)?\s+/c\s+echo\s+([^\s\r\n\x00>]+)[^\r\n\x00]*rem\s+\(part\s*(\d+)/(\d+)\))", hive_bytes, re.IGNORECASE)
+                        for rm in runmru_matches:
+                            val = rm.group(1).decode("latin-1", errors="ignore").strip()
+                            p_idx = int(rm.group(2))
+                            p_tot = int(rm.group(3))
+                            results["flags_found"].append({
+                                "flag": val,
+                                "encoding": f"Registry RunMRU (part {p_idx}/{p_tot})",
+                                "context": f"Part {p_idx} of {p_tot} from {file}"
+                            })
                     except Exception:
                         pass
 
+                # 4. NTFS USN Journal ($J / $Extend\$J)
+                elif f_lower in ("$j", "$usnjrnl", "$usnjrnl:$j") or "usn" in f_lower or file == "$J":
+                    results["is_kape_triage"] = True
+                    try:
+                        with open(f_path, "rb") as f:
+                            usn_bytes = f.read(50 * 1024 * 1024)
+                        # Search for temporary files with Base64 names (e.g. PART1OF3__SGFja1RvZGF5MjZ7...tmp)
+                        usn_matches = re.finditer(rb"(?:PART(\d+)OF(\d+)__)?([A-Za-z0-9+/=]{16,64})\.(?:tmp|dat|bin|ps1)", usn_bytes)
+                        for um in usn_matches:
+                            p_idx = int(um.group(1)) if um.group(1) else 1
+                            p_tot = int(um.group(2)) if um.group(2) else 3
+                            b64_name = um.group(3).decode("latin-1", errors="ignore")
+                            try:
+                                pad = (4 - len(b64_name) % 4) % 4
+                                dec_name = base64.b64decode((b64_name + "=" * pad).encode("ascii")).decode("latin-1", errors="ignore")
+                                results["flags_found"].append({
+                                    "flag": dec_name,
+                                    "encoding": f"USN Journal $J Base64 (part {p_idx}/{p_tot})",
+                                    "context": f"Decoded filename: {b64_name}.tmp -> {dec_name}"
+                                })
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # 5. Scheduled Tasks XML (Windows\System32\Tasks)
+                elif "tasks" in root.lower() or f_lower.endswith(".xml") or "task" in f_lower:
+                    try:
+                        with open(f_path, "rb") as f:
+                            task_bytes = f.read(2 * 1024 * 1024)
+                        # Extract -EncodedCommand
+                        enc_matches = re.finditer(rb"(?:-enc|-encodedcommand)\s+([A-Za-z0-9+/=]{16,})", task_bytes, re.IGNORECASE)
+                        for em in enc_matches:
+                            b64_val = em.group(1).decode("ascii", errors="ignore")
+                            try:
+                                pad = (4 - len(b64_val) % 4) % 4
+                                dec_cmd = base64.b64decode((b64_val + "=" * pad).encode("ascii")).decode("utf-16le", errors="ignore")
+                                for fl in self.string_hunter.hunt_flags(dec_cmd):
+                                    fl["encoding"] = f"Scheduled Task XML ({fl['encoding']})"
+                                    fl["context"] = f"Task {file}: {fl['context']}"
+                                    results["flags_found"].append(fl)
+
+                                # Extract (part X/Y) from comments or commands
+                                m_part = re.search(r"\(part\s*(\d+)/(\d+)\)\s*([A-Za-z0-9_\-\{\}\!@#\$%\^&\*\+=~`]+)", dec_cmd, re.IGNORECASE)
+                                if m_part:
+                                    p_idx = int(m_part.group(1))
+                                    p_tot = int(m_part.group(2))
+                                    p_val = m_part.group(3).strip()
+                                    results["flags_found"].append({
+                                        "flag": p_val,
+                                        "encoding": f"Scheduled Task Script (part {p_idx}/{p_tot})",
+                                        "context": f"Part {p_idx} of {p_tot} from Task {file}"
+                                    })
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+        # 6. Multi-Part Flag Synthesis (Assemble part 1 + part 2 + part 3)
+        parts_collected: Dict[int, str] = {}
+        for fl in results["flags_found"]:
+            m_p = re.search(r"\(part\s*(\d+)/(\d+)\)", fl.get("encoding", "") + " " + fl.get("context", ""))
+            if m_p:
+                idx = int(m_p.group(1))
+                parts_collected[idx] = fl.get("flag", "").strip()
+
+        if len(parts_collected) >= 3 and 1 in parts_collected and 2 in parts_collected and 3 in parts_collected:
+            assembled_flag = parts_collected[1] + parts_collected[2] + parts_collected[3]
+            if self.string_hunter.is_valid_flag(assembled_flag):
+                results["flags_found"].insert(0, {
+                    "flag": assembled_flag,
+                    "encoding": "Synthesized 3-Part Flag (USN Journal + Registry + Scheduled Task)",
+                    "context": f"Combined: {parts_collected[1]} + {parts_collected[2]} + {parts_collected[3]}"
+                })
+
         return results
+

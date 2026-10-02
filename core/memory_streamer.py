@@ -413,11 +413,126 @@ class MemoryStreamer:
                         if ntlm_line not in results["ntlm_hashes"]:
                             results["ntlm_hashes"].append(ntlm_line)
 
-                    prev_overlap = chunk[-self.overlap:] if len(chunk) >= self.overlap else chunk
+                    # 16. Web Server & CMS Incident Response Profiler (WordPress / Apache / Nginx)
+                    log_matches = re.finditer(
+                        rb"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+-\s+-\s+\[([^\]]+)\]\s+\"([A-Z]+)\s+([^\s\"]+)\s+HTTP/[0-9\.]+\"\s+(\d{3})\s+(\d+)",
+                        current_buffer
+                    )
+                    for lm in log_matches:
+                        ip_str = lm.group(1).decode("ascii")
+                        method = lm.group(3).decode("ascii")
+                        url_path = lm.group(4).decode("latin-1")
 
+                        if "web_ir_killchain" not in results:
+                            results["web_ir_killchain"] = {
+                                "target_hosts": set(),
+                                "attacker_ips": {},
+                                "failed_logins": 0,
+                                "exploited_endpoints": set(),
+                                "cve_mentions": set(),
+                                "webshells": set(),
+                                "rce_parameters": set(),
+                                "executed_commands": []
+                            }
+
+                        if "wp-login.php" in url_path or "login" in url_path.lower():
+                            if method == "POST":
+                                results["web_ir_killchain"]["failed_logins"] += 1
+                                results["web_ir_killchain"]["attacker_ips"][ip_str] = results["web_ir_killchain"]["attacker_ips"].get(ip_str, 0) + 1
+
+                        if "admin-ajax.php" in url_path or "xmlrpc.php" in url_path:
+                            results["web_ir_killchain"]["exploited_endpoints"].add(url_path)
+
+                        if "plugins" in url_path or "uploads" in url_path:
+                            if ".php" in url_path:
+                                results["web_ir_killchain"]["webshells"].add(url_path)
+
+                    host_matches = re.finditer(rb"(?:^|[\r\n\x00\s])Host:\s*([a-zA-Z0-9_\-\.]+)", current_buffer, re.IGNORECASE)
+                    for hm in host_matches:
+                        h_str = hm.group(1).decode("ascii", errors="ignore").strip()
+                        if h_str and "." in h_str:
+                            if "web_ir_killchain" not in results:
+                                results["web_ir_killchain"] = {
+                                    "target_hosts": set(),
+                                    "attacker_ips": {},
+                                    "failed_logins": 0,
+                                    "exploited_endpoints": set(),
+                                    "cve_mentions": set(),
+                                    "webshells": set(),
+                                    "rce_parameters": set(),
+                                    "executed_commands": []
+                                }
+                            results["web_ir_killchain"]["target_hosts"].add(h_str)
+
+                    cve_matches = re.finditer(rb"CVE-\d{4}-\d{4,7}", current_buffer, re.IGNORECASE)
+                    for cm in cve_matches:
+                        cve_str = cm.group(0).decode("ascii").upper()
+                        if "web_ir_killchain" not in results:
+                            results["web_ir_killchain"] = {
+                                "target_hosts": set(),
+                                "attacker_ips": {},
+                                "failed_logins": 0,
+                                "exploited_endpoints": set(),
+                                "cve_mentions": set(),
+                                "webshells": set(),
+                                "rce_parameters": set(),
+                                "executed_commands": []
+                            }
+                        results["web_ir_killchain"]["cve_mentions"].add(cve_str)
+
+                    ws_exec_matches = re.finditer(rb"(?:shell_exec|system|passthru|eval)\s*\(\s*\$_(?:REQUEST|GET|POST)\[['\"]([a-zA-Z0-9_\-]+)['\"]\]", current_buffer)
+                    for wsm in ws_exec_matches:
+                        param = wsm.group(1).decode("ascii", errors="ignore")
+                        if "web_ir_killchain" not in results:
+                            results["web_ir_killchain"] = {
+                                "target_hosts": set(),
+                                "attacker_ips": {},
+                                "failed_logins": 0,
+                                "exploited_endpoints": set(),
+                                "cve_mentions": set(),
+                                "webshells": set(),
+                                "rce_parameters": set(),
+                                "executed_commands": []
+                            }
+                        results["web_ir_killchain"]["rce_parameters"].add(param)
+
+                    param_call_matches = re.finditer(rb"[?&]([a-zA-Z0-9_\-]+)=([a-zA-Z0-9_\-\.%]{1,60})\s+HTTP/1\.[01]", current_buffer)
+                    for pcm in param_call_matches:
+                        p_name = pcm.group(1).decode("ascii", errors="ignore")
+                        p_cmd = pcm.group(2).decode("ascii", errors="ignore")
+                        if p_name in ("wpc_diag", "cmd", "exec", "c", "shell", "run") or p_cmd in ("id", "whoami", "uname", "ls", "cat"):
+                            if "web_ir_killchain" not in results:
+                                results["web_ir_killchain"] = {
+                                    "target_hosts": set(),
+                                    "attacker_ips": {},
+                                    "failed_logins": 0,
+                                    "exploited_endpoints": set(),
+                                    "cve_mentions": set(),
+                                    "webshells": set(),
+                                    "rce_parameters": set(),
+                                    "executed_commands": []
+                                }
+                            results["web_ir_killchain"]["rce_parameters"].add(p_name)
+                            if p_cmd not in results["web_ir_killchain"]["executed_commands"]:
+                                results["web_ir_killchain"]["executed_commands"].append(p_cmd)
+
+                    prev_overlap = chunk[-self.overlap:] if len(chunk) >= self.overlap else chunk
 
         except Exception as e:
             results["error"] = f"Streaming memory error: {str(e)}"
+
+        if "web_ir_killchain" in results:
+            wk = results["web_ir_killchain"]
+            if isinstance(wk.get("target_hosts"), set):
+                wk["target_hosts"] = sorted(list(wk["target_hosts"]))
+            if isinstance(wk.get("exploited_endpoints"), set):
+                wk["exploited_endpoints"] = sorted(list(wk["exploited_endpoints"]))
+            if isinstance(wk.get("cve_mentions"), set):
+                wk["cve_mentions"] = sorted(list(wk["cve_mentions"]))
+            if isinstance(wk.get("webshells"), set):
+                wk["webshells"] = sorted(list(wk["webshells"]))
+            if isinstance(wk.get("rce_parameters"), set):
+                wk["rce_parameters"] = sorted(list(wk["rce_parameters"]))
 
         return results
 

@@ -152,6 +152,20 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
     elif primary_ext in ("g", "bgcode", "gcode") or header_sample.startswith(b"GCDE"):
         detected_cat = "3D Printing & G-Code Forensics"
 
+    # Check ESP32 flash dump signature (magic 0xAA 0xE5 at offset 0x8000)
+    is_esp32 = False
+    try:
+        if os.path.exists(file_path) and os.path.getsize(file_path) >= 0x8020:
+            with open(file_path, "rb") as f_chk:
+                f_chk.seek(0x8000)
+                if f_chk.read(2) == b"\xaa\xe5":
+                    is_esp32 = True
+    except Exception:
+        pass
+
+    if is_esp32 or "esp32" in file_path.lower() or "flash_dump" in file_path.lower():
+        detected_cat = "IoT / ESP32 Flash Memory & Firmware Forensics"
+
     print(f" [+] Kategori Soal Terdeteksi: \033[1;32m{detected_cat}\033[0m")
     print(f" [*] Format Biner:             {name} (Ekstensi Standar: .{primary_ext})")
     print(f" [*] Shannon Entropy:          {entropy:.3f} / 8.0")
@@ -483,13 +497,34 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
                     for img in fb_res["saved_images"][:3]:
                         print(f"     -> {img}")
 
-            # --- Step B3: Tampilkan Volatility recommendations ---
+            # --- Step B3: Web Incident Response & WordPress Kill-Chain Matrix ---
+            if m_res.get("web_ir_killchain"):
+                wk = m_res["web_ir_killchain"]
+                if wk.get("target_hosts") or wk.get("failed_logins") or wk.get("cve_mentions"):
+                    print("\n \033[1;36m[+] Incident Response (IR) & Kill-Chain Matrix:\033[0m")
+                    if wk.get("target_hosts"):
+                        print(f"     1. Target Host/Site:         \033[1;32m{', '.join(wk['target_hosts'])}\033[0m")
+                    if wk.get("failed_logins"):
+                        top_att_ip = max(wk["attacker_ips"].items(), key=lambda x: x[1])[0] if wk.get("attacker_ips") else "Unknown"
+                        print(f"     2. Failed Login Attempts:    \033[1;31m{wk['failed_logins']} kali\033[0m (Top Attacker IP: {top_att_ip})")
+                    if wk.get("exploited_endpoints"):
+                        print(f"     3. Exploited Endpoint:       {', '.join(wk['exploited_endpoints'])}")
+                    if wk.get("cve_mentions"):
+                        print(f"     4. CVE ID Diserang:          \033[1;31m{', '.join(wk['cve_mentions'])}\033[0m")
+                    if wk.get("webshells"):
+                        print(f"     5. Webshell Path:            \033[1;33m{', '.join(wk['webshells'])}\033[0m")
+                    if wk.get("rce_parameters"):
+                        print(f"     6. RCE Parameter:            {', '.join(wk['rce_parameters'])}")
+                    if wk.get("executed_commands"):
+                        print(f"     7. Perintah Awal Penyerang:  \033[1;32m{', '.join(wk['executed_commands'])}\033[0m")
+
+            # --- Step B4: Tampilkan Volatility recommendations ---
             if m_res.get("volatility_recommendations"):
                 print(f"\n \033[1;36m[*] Volatility 3 — Command yang disarankan:\033[0m")
                 for vc in m_res["volatility_recommendations"]:
                     print(f"     {vc}")
 
-            # --- Step B4: Auto-run Volatility jika tersedia ---
+            # --- Step B5: Auto-run Volatility jika tersedia ---
             if memory_streamer.has_vol and m_res.get("kernel_banner") and not stop_signal[0]:
                 print("\n [*] Mencoba Volatility 3 pslist & bash history otomatis...")
                 for vol_cmd_args in [
@@ -511,6 +546,39 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
                                     print(f"     {ln}")
                     except Exception:
                         pass
+
+
+        # B2. IOT / ESP32 FLASH MEMORY FORENSICS
+        elif "ESP32" in detected_cat:
+            print(" [*] Menjalankan modul forensik ESP32 Flash Memory & NVS...")
+            try:
+                from core.esp32_inspector import ESP32Inspector
+                esp_inspector = ESP32Inspector(output_dir=target_out_dir)
+                esp_res = esp_inspector.inspect_flash_dump(file_path)
+                task_results["esp32"] = esp_res
+
+                if esp_res.get("partition_table"):
+                    print(f" [+] Tabel Partisi ESP-IDF ({len(esp_res['partition_table'])} partisi):")
+                    for p in esp_res["partition_table"]:
+                        print(f"     - {p['label']:<12} Offset: {hex(p['offset'])}  Size: {p['size'] // 1024} KB")
+
+                if esp_res.get("recovered_keys"):
+                    print(f" [+] Kunci Konfigurasi Ter-deobfuscate (XOR 0x80): {len(esp_res['recovered_keys'])}:")
+                    for rk in esp_res["recovered_keys"]:
+                        print(f"     -> \033[1;32m{rk['deobfuscated_key']}\033[0m ({rk['var']} @ {rk['offset']})")
+
+                if esp_res.get("decoy_flags"):
+                    print(f" \033[1;33m[!] Decoy / Bait Flag Terdeteksi & Difilter (Jebakan!):\033[0m")
+                    for df in esp_res["decoy_flags"]:
+                        print(f"     -> {df['flag']} ({df['reason']})")
+
+                if esp_res.get("slack_space_artifacts"):
+                    print(f" [+] Artefak Slack Space (Unallocated): {len(esp_res['slack_space_artifacts'])} potongan Base64")
+
+                for fl in esp_res.get("flags_found", []):
+                    on_instant_flag(fl, "ESP32 Firmware Forensics")
+            except Exception as e:
+                print(f" [-] Gagal membedah ESP32 flash: {e}")
 
 
         # C. CITRA / STEGANOGRAFI
