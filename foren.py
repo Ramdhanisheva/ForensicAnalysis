@@ -118,7 +118,11 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: O
             header_sample = f.read(header_read_size)
     except Exception as e:
         print(f"\033[1;31m[-] Gagal membaca file: {e}\033[0m")
-        return {}
+    is_lime_file = (
+        file_path.lower().endswith(".lime")
+        or header_sample.startswith((b"EMiL", b"LiME"))
+        or delime
+    )
 
     # =========================================================================
     # TAHAP 1: DETEKSI TIPE SOAL & ANOMALI STRUKTUR
@@ -395,7 +399,7 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: O
     # =========================================================================
     # TAHAP 6: ANALISA SPESIFIK SESUAI KATEGORI SOAL & ADAPTIVE FALLBACK
     # =========================================================================
-    if not stop_signal[0]:
+    if not stop_signal[0] or is_lime_file:
         print("\n\033[1;35m--- [ Tahap 6: Analisa Spesifik Sesuai Kategori Soal & Adaptive Fallback ] ---\033[0m")
 
         executed_modules = set()
@@ -543,13 +547,14 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: O
                         if len(lime_ranges) > 5:
                             print(f"     ... ({len(lime_ranges) - 5} rentang memori fisik lainnya)")
 
-                        if delime:
+                        if delime or file_path.lower().endswith(".lime") or header_sample.startswith((b"EMiL", b"LiME")):
                             raw_out_path = os.path.join(target_out_dir, f"{os.path.splitext(file_name)[0]}.raw")
-                            print(f" [*] Melakukan De-LiME (Konversi ke Flat Physical RAM .raw)...")
-                            conv_res = memory_streamer.convert_lime_to_raw(file_path, raw_out_path)
-                            if conv_res.get("success"):
-                                print(f" [+] Sukses De-LiME: {conv_res['total_bytes_written']:,} bytes tersimpan di {raw_out_path}")
-                                task_results["delime_raw"] = raw_out_path
+                            if not os.path.exists(raw_out_path) or os.path.getsize(raw_out_path) == 0:
+                                print(f" [*] Auto De-LiME: Mengonversi format LiME ke Flat Physical RAM .raw...")
+                                conv_res = memory_streamer.convert_lime_to_raw(file_path, raw_out_path)
+                                if conv_res.get("success"):
+                                    print(f" [+] Sukses De-LiME: {conv_res['total_bytes_written']:,} bytes tersimpan di {raw_out_path}")
+                                    task_results["delime_raw"] = raw_out_path
 
                 # B1: WSL strings + grep (fast, bounded to 20s)
                 wsl_distros = ["kali-linux", "Ubuntu", "Debian"]
@@ -1075,11 +1080,86 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: O
 
     return {
         "target_file": file_path,
+        "target_name": file_name,
         "all_flags": all_discovered_flags,
-        "saved_artifacts": saved_artifacts
+        "saved_artifacts": saved_artifacts,
+        "target_out_dir": target_out_dir
     }
 
 
+def synthesize_multi_target_summary(results: List[Dict[str, Any]], tool_name: str = "Tool Analysis Foren"):
+    """
+    Rangkuman cerdas untuk analisis jamak (multiple files / directory / glob).
+    Menyusun tabel hasil, menganalisis kemungkinan flag multi-part / terpisah,
+    dan memberikan kesimpulan akhir yang jelas.
+    """
+    if not results:
+        return
+
+    print("\n" + "=" * 70)
+    print(f"[*] RANGKUMAN HASIL ANALISIS JAMAK (TOTAL: {len(results)} TARGET) - {tool_name}")
+    print("=" * 70)
+
+    all_flags_list = []
+    seen_flags = set()
+    partial_flags = []
+
+    for idx, r in enumerate(results, 1):
+        target_name = r.get("target_name") or os.path.basename(r.get("target_file", "unknown"))
+        flags = r.get("all_flags", [])
+        out_dir = r.get("target_out_dir", "N/A")
+        artifacts = r.get("saved_artifacts", [])
+
+        print(f"\n[{idx}] Target: {target_name}")
+        if flags:
+            print(f"    Status : FLAG FOUND ({len(flags)} flag)")
+            for f_info in flags:
+                f_val = f_info.get("flag", "")
+                enc = f_info.get("encoding", "N/A")
+                print(f"    -> Flag   : {f_val}")
+                print(f"       Method : {enc}")
+                if f_val not in seen_flags:
+                    seen_flags.add(f_val)
+                    all_flags_list.append((target_name, f_val, enc))
+                    if "{" in f_val and not f_val.endswith("}"):
+                        partial_flags.append((target_name, f_val, "prefix"))
+                    elif "}" in f_val and "{" not in f_val:
+                        partial_flags.append((target_name, f_val, "suffix"))
+        else:
+            print(f"    Status : MANUAL TRIAGE / SELESAI")
+            if artifacts:
+                print(f"    Hasil  : {len(artifacts)} file ter-ekstrak di folder output")
+            else:
+                print(f"    Hasil  : Tidak ada file biner tersembunyi terdeteksi langsung")
+            print(f"    Output : {out_dir}")
+
+    # Rekonstruksi Flag Multi-Part jika ada indikasi bagian terpisah
+    reconstructed_flags = []
+    prefixes = [p for p in partial_flags if p[2] == "prefix"]
+    suffixes = [s for s in partial_flags if s[2] == "suffix"]
+    if prefixes and suffixes:
+        for p_target, p_val, _ in prefixes:
+            for s_target, s_val, _ in suffixes:
+                combined = p_val + s_val
+                if combined not in seen_flags:
+                    reconstructed_flags.append(combined)
+
+    print("\n" + "-" * 70)
+    print("[*] KESIMPULAN AKHIR:")
+    if reconstructed_flags:
+        print("\n [!] TERDETEKSI FLAG MULTI-PART (GABUNGAN DARI BERBAGAI FILE):")
+        for rf in reconstructed_flags:
+            print(f"     >>> {rf} <<<")
+
+    if all_flags_list:
+        print(f"\n [+] Total Flag Valid Ditemukan : {len(all_flags_list)}")
+        for i, (src, fv, enc) in enumerate(all_flags_list, 1):
+            print(f"     {i}. {fv} (Sumber: {src})")
+    else:
+        print("\n [-] Tidak ada flag yang ditemukan secara otomatis dari seluruh target.")
+        print(" [*] Silakan periksa masing-masing folder output untuk analisis mendalam.")
+
+    print("=" * 70 + "\n")
 
 
 def main():
@@ -1099,15 +1179,14 @@ def main():
 
 \033[1;32mCONTOH PENGGUNAAN:\033[0m
   foren challenge.png
-  foren challenge.png -o ./output
-  foren challenge.png -o /home/ramdhan/FinalHackToday/output
-  foren babyshark.pcapng -o ./pcap_extracted
-  foren memory.lime --delime -o ./ram_hasil
-  foren secret.pdf -o ./pdf_out
+  foren chall_1.png chall_2.pcap chall_3.lime
+  foren ./soal_ctf/* -o ./output_kolektif
+  foren ./folder_soal/
+  foren memory.lime
   foren dump.raw --no-stop
 """
     )
-    parser.add_argument("target", nargs="?", help="Path ke file soal forensik CTF yang ingin dianalisis")
+    parser.add_argument("targets", nargs="*", help="Path ke satu atau lebih file/folder/wildcard target soal forensik CTF")
     parser.add_argument("-o", "--output", "--outdir", dest="output", default=None,
                         help="Folder tujuan hasil analisa, gambar ter-ekstrak, PDF, dan artefak (dibuat otomatis jika belum ada)")
     parser.add_argument("--no-stop", dest="stop_on_flag", action="store_false", default=True,
@@ -1117,25 +1196,74 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.target:
+    if not args.targets:
         parser.print_help()
-        print("\n\033[1;33mContoh Cepat: foren <nama_file_soal> -o ./output\033[0m\n")
+        print("\n\033[1;33mContoh Cepat:\033[0m")
+        print("  foren challenge.png")
+        print("  foren chall_1.png chall_2.png")
+        print("  foren ./folder_soal/")
+        print("  foren memory.lime\n")
         sys.exit(0)
 
-    target_path = os.path.abspath(args.target)
-    if not os.path.exists(target_path):
-        print(f"\033[1;31m[-] Target '{args.target}' tidak ditemukan.\033[0m", file=sys.stderr)
+    import glob
+
+    # 1. Expand globs / wildcards
+    expanded_targets = []
+    for arg_t in args.targets:
+        if any(c in arg_t for c in ("*", "?", "[", "]")):
+            matches = glob.glob(arg_t)
+            if matches:
+                expanded_targets.extend(matches)
+            else:
+                expanded_targets.append(arg_t)
+        else:
+            expanded_targets.append(arg_t)
+
+    # 2. Collect files from targets and directories
+    files_to_analyze = []
+    for t in expanded_targets:
+        t_abs = os.path.abspath(t)
+        if not os.path.exists(t_abs):
+            print(f"\033[1;31m[-] Target '{t}' tidak ditemukan.\033[0m", file=sys.stderr)
+            continue
+        if os.path.isdir(t_abs):
+            print(f"[*] Direktori terdeteksi: Memindai semua berkas dalam '{t_abs}'...")
+            for root, _, files in os.walk(t_abs):
+                for f in sorted(files):
+                    fp = os.path.join(root, f)
+                    if os.path.isfile(fp) and os.path.getsize(fp) > 0:
+                        files_to_analyze.append(fp)
+        else:
+            files_to_analyze.append(t_abs)
+
+    # Deduplicate while preserving order
+    unique_files = []
+    seen = set()
+    for f in files_to_analyze:
+        if f not in seen:
+            seen.add(f)
+            unique_files.append(f)
+
+    if not unique_files:
+        print("[-] Tidak ada berkas valid untuk dianalisis.")
         sys.exit(1)
 
-    if os.path.isdir(target_path):
-        print(f"[*] Memindai seluruh folder: {target_path}")
-        for root, _, files in os.walk(target_path):
-            for file in files:
-                p = os.path.join(root, file)
-                sub_out = os.path.join(args.output, f"out_{file}") if args.output else None
-                run_forensic_solver(p, stop_on_flag=args.stop_on_flag, output_base=sub_out, delime=args.delime)
-    else:
-        run_forensic_solver(target_path, stop_on_flag=args.stop_on_flag, output_base=args.output, delime=args.delime)
+    all_results = []
+    for idx, f_target in enumerate(unique_files, 1):
+        if len(unique_files) > 1:
+            print(f"\n\033[1;34m{'=' * 65}\033[0m")
+            print(f"\033[1;34m[*] MEMPROSES TARGET [{idx}/{len(unique_files)}]: {os.path.basename(f_target)}\033[0m")
+            print(f"\033[1;34m{'=' * 65}\033[0m")
+
+        sub_out = os.path.join(args.output, f"out_{os.path.basename(f_target)}") if (args.output and len(unique_files) > 1) else args.output
+        res = run_forensic_solver(f_target, stop_on_flag=args.stop_on_flag, output_base=sub_out, delime=args.delime)
+        if res:
+            res["target_name"] = os.path.basename(f_target)
+            res["target_out_dir"] = sub_out or res.get("target_out_dir", "N/A")
+            all_results.append(res)
+
+    if len(all_results) > 1:
+        synthesize_multi_target_summary(all_results, tool_name="Tool Analysis Foren")
 
 
 if __name__ == "__main__":
