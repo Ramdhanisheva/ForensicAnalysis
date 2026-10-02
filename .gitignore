@@ -1,0 +1,39 @@
+﻿# Results & Artifacts (generated at runtime, can be huge)
+results/
+extracted_artifacts/
+
+# Large binary challenge files (don't commit to repo)
+*.lime
+*.7z
+*.ad1
+*.vmem
+*.raw
+*.dmp
+*.mem
+*.E01
+*.ewf
+*.dd
+sample_challenges/victim_ram.lime
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.bak

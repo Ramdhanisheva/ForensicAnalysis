@@ -1,0 +1,17 @@
+﻿# CTF Forensics Toolkit - Dependencies
+# Install: pip install -r requirements.txt
+
+# Archive extraction (.7z support with password)
+py7zr
+
+# Windows Event Log parsing (.evtx)
+python-evtx
+
+# Image metadata (EXIF, IPTC, XMP)
+Pillow
+
+# Network capture analysis (.pcap / .pcapng)
+scapy
+
+# PCAP parsing (pure Python fallback, no libpcap needed)
+dpkt
