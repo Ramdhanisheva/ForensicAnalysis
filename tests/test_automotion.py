@@ -221,6 +221,45 @@ class TestAutomotionForensics(unittest.TestCase):
         self.assertTrue(any("HackToday26{lime_ram_streaming_solved}" in fl["flag"] for fl in mem_res["flags_found"]))
         self.assertTrue(any("cat /etc/shadow" in cmd for cmd in mem_res["bash_commands"]))
 
+    def test_lime_header_parser_and_raw_converter(self):
+        """Test LiME header range parsing and De-LiME raw physical memory extraction."""
+        lime_path = os.path.join(self.test_dir, "multirange.lime")
+        out_raw = os.path.join(self.test_dir, "extracted.raw")
+
+        # Range 1: 0x0 to 0x3ff (1024 bytes)
+        hdr1 = b"EMiL" + struct.pack("<IQQ", 1, 0x0, 0x3ff) + b"\x00" * 8
+        payload1 = b"RANGE_1_DATA_" * 78 + b"\x00" * 10  # 1024 bytes
+        self.assertEqual(len(payload1), 1024)
+
+        # Range 2: 0x1000 to 0x17ff (2048 bytes)
+        hdr2 = b"EMiL" + struct.pack("<IQQ", 1, 0x1000, 0x17ff) + b"\x00" * 8
+        payload2 = b"FLAG_IN_RANGE2_HackToday26{delime_extractor_success}" + b"\x00" * (2048 - 52)
+        self.assertEqual(len(payload2), 2048)
+
+        with open(lime_path, "wb") as f:
+            f.write(hdr1 + payload1 + hdr2 + payload2)
+
+        # 1. Test parsing
+        ranges = self.mem.parse_lime_headers(lime_path)
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(ranges[0]["start_addr"], "0x0")
+        self.assertEqual(ranges[0]["size_bytes"], 1024)
+        self.assertEqual(ranges[1]["start_addr"], "0x1000")
+        self.assertEqual(ranges[1]["size_bytes"], 2048)
+
+        # 2. Test De-LiME conversion
+        res = self.mem.convert_lime_to_raw(lime_path, out_raw)
+        self.assertTrue(res["success"])
+        self.assertEqual(res["ranges_extracted"], 2)
+        self.assertEqual(res["total_bytes_written"], 1024 + 2048)
+
+        with open(out_raw, "rb") as rf:
+            raw_data = rf.read()
+        self.assertEqual(len(raw_data), 3072)
+        self.assertIn(b"FLAG_IN_RANGE2_HackToday26{delime_extractor_success}", raw_data)
+        # Headers should be completely removed
+        self.assertNotIn(b"EMiL", raw_data)
+
     def test_db_inspector(self):
         """Test SQLite inspector: table enumeration, text search, and slack carving."""
         db_path = os.path.join(self.test_dir, "test.sqlite")
@@ -948,6 +987,223 @@ class TestAutomotionForensics(unittest.TestCase):
         # Verify dynamic flag found
         flags = [f["flag"] for f in res.get("flags_found", [])]
         self.assertTrue(any("fl4sh_dyn4m1c_p_succ3ss" in fl for fl in flags))
+
+
+    def test_scanner_17_clipboard_recovery(self):
+        """Scanner 17: Windows Clipboard CF_TEXT flag recovery from memory dump."""
+        import tempfile, os, struct
+        mem_data = b"\x00" * 0x200
+        flag = b"HackToday26{cl1pb0ard_w4s_w4tch1ng}"
+        mem_data += b"CF_TEXT\x00\x00\x00" + flag
+        mem_data += b"\x00" * 0x200
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            # Clipboard flag found either directly or via hunt_flags on clipboard text
+            all_flags = [fl["flag"] for fl in res["flags_found"]]
+            self.assertTrue(
+                any("cl1pb0ard_w4s_w4tch1ng" in fl for fl in all_flags),
+                f"Clipboard flag not found. Flags: {all_flags}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scanner_18_sam_hashdump(self):
+        """Scanner 18: SAM/LSASS hashdump format extraction from memory dump."""
+        import tempfile, os
+        sam_block = (
+            b"Administrator:500:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::\n"
+            b"ctfplayer:1001:aad3b435b51404eeaad3b435b51404ee:5f4dcc3b5aa765d61d8327deb882cf99:::\n"
+        )
+        mem_data = b"\x00" * 0x100 + sam_block + b"\x00" * 0x100
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            hashes = res.get("ntlm_hashes", [])
+            self.assertTrue(
+                any("Administrator" in h for h in hashes),
+                f"SAM hash not found. Hashes: {hashes}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scanner_19_powershell_encoded_command(self):
+        """Scanner 19: PowerShell -EncodedCommand base64 UTF-16LE decoder."""
+        import tempfile, os, base64
+        ps_script = "Write-Host HackToday26{p0w3rsh3ll_3nc0d3d_s3cr3t}"
+        ps_encoded = base64.b64encode(ps_script.encode("utf-16-le")).decode()
+        ps_cmd = f"-EncodedCommand {ps_encoded}".encode("ascii")
+        mem_data = b"\x00" * 0x100 + ps_cmd + b"\x00" * 0x100
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            all_flags = [fl["flag"] for fl in res["flags_found"]]
+            self.assertTrue(
+                any("p0w3rsh3ll_3nc0d3d_s3cr3t" in fl for fl in all_flags),
+                f"PS encoded flag not found. Flags: {all_flags}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scanner_20_shellcode_malfind(self):
+        """Scanner 20: Metasploit x64 shellcode preamble detection (malfind-style)."""
+        import tempfile, os
+        # Metasploit x64 shellcode preamble: fc 48 83 e4 f0
+        shellcode = bytes([0xfc, 0x48, 0x83, 0xe4, 0xf0, 0xe8, 0xcc, 0x00, 0x00, 0x00])
+        mem_data = b"\x00" * 0x200 + shellcode + b"\x00" * 0x200
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            hits = res.get("shellcode_hits", [])
+            self.assertTrue(
+                any("Metasploit" in h.get("signature", "") for h in hits),
+                f"Shellcode signature not detected. Hits: {hits}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scanner_21_truecrypt_veracrypt_header(self):
+        """Scanner 21: VeraCrypt volume header detection in memory dump."""
+        import tempfile, os
+        # VeraCrypt: 64-byte salt + "VERA" at offset 64 from sector boundary
+        vera_sector = b"\x00" * 64 + b"VERA" + b"\x00" * 444
+        mem_data = b"\x00" * 0x200 + vera_sector + b"\x00" * 0x200
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            vols = res.get("crypto_volumes", [])
+            self.assertTrue(
+                any("VERA" in v.get("type", "") for v in vols),
+                f"VeraCrypt header not detected. Volumes: {vols}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scanner_23_network_credentials(self):
+        """Scanner 23: FTP USER/PASS and HTTP Basic Auth credential extraction."""
+        import tempfile, os, base64
+        # FTP credential
+        ftp_cred = b"USER ctfuser\r\nPASS HackToday26{ftp_cr3d_in_r4m}\r\n230 OK\r\n"
+        # HTTP Basic Auth
+        http_cred_raw = b"ctfuser:HackToday26{http_b4s1c_4uth_fl4g}"
+        http_cred_b64 = base64.b64encode(http_cred_raw).decode()
+        http_header = f"Authorization: Basic {http_cred_b64}\r\n".encode()
+
+        mem_data = b"\x00" * 0x100 + ftp_cred + b"\x00" * 0x100 + http_header + b"\x00" * 0x100
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            all_flags = [fl["flag"] for fl in res["flags_found"]]
+            net_creds = res.get("network_credentials", [])
+            # Either FTP or HTTP auth flag should be found
+            ftp_found = any("ftp_cr3d_in_r4m" in fl for fl in all_flags)
+            http_found = any("http_b4s1c_4uth_fl4g" in fl for fl in all_flags)
+            # Or at minimum credentials extracted
+            creds_found = any("ctfuser" in c for c in net_creds)
+            self.assertTrue(
+                ftp_found or http_found or creds_found,
+                f"Net creds not extracted. Flags: {all_flags}, Creds: {net_creds}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_scanner_24_registry_artifacts(self):
+        """Scanner 24: Windows Registry Run key with embedded flag."""
+        import tempfile, os
+        reg_run_key = (
+            b"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run\x00"
+            b"CTFAgent\x00HackToday26{r3g1stry_run_k3y_p3rs1st}\x00"
+        )
+        mem_data = b"\x00" * 0x100 + reg_run_key + b"\x00" * 0x100
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".raw") as f:
+            f.write(mem_data)
+            tmp_path = f.name
+        try:
+            res = self.mem.scan_memory_dump(tmp_path)
+            all_flags = [fl["flag"] for fl in res["flags_found"]]
+            reg_artifacts = res.get("registry_artifacts", [])
+            # Flag should appear in flags or registry artifacts
+            flag_found = any("r3g1stry_run_k3y_p3rs1st" in fl for fl in all_flags)
+            reg_found = any("CurrentVersion\\Run" in r or "r3g1stry" in r for r in reg_artifacts)
+            self.assertTrue(
+                flag_found or reg_found,
+                f"Registry flag/artifact not found. Flags: {all_flags}, Reg: {reg_artifacts}"
+            )
+        finally:
+            os.unlink(tmp_path)
+
+    def test_advanced_lime_challenge_multi_scanner(self):
+        """Integration: advanced_ctf.lime with PS encoded, clipboard, FTP, HTTP auth, shellcode, VeraCrypt."""
+        import os
+        chall_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "sample_challenges", "challenge_advanced_ctf.lime"
+        )
+        if not os.path.exists(chall_path):
+            self.skipTest(f"Challenge file not found: {chall_path}")
+
+        res = self.mem.scan_memory_dump(chall_path)
+
+        # 1. Verify LiME ranges detected
+        self.assertIsNotNone(res.get("memory_type"))
+        self.assertIn("LiME", res.get("memory_type", ""))
+
+        all_flags = [fl["flag"] for fl in res.get("flags_found", [])]
+
+        # 2. Plaintext flag should always be found
+        self.assertTrue(
+            any("pl41n_m3m0ry_dump_f0und" in fl for fl in all_flags),
+            f"Plaintext flag not found. Flags: {all_flags}"
+        )
+
+        # 3. At least 3 out of 7 flags should be found (multi-technique)
+        expected_flags = [
+            "p0w3rsh3ll_3nc0d3d_s3cr3t",
+            "cl1pb0ard_w4s_w4tch1ng",
+            "ftp_cr3d_in_r4m",
+            "http_b4s1c_4uth_fl4g",
+            "r3g1stry_run_k3y_p3rs1st",
+            "pl41n_m3m0ry_dump_f0und",
+            "st3g_h1nt_fr0m_r4m",
+        ]
+        found_count = sum(1 for exp in expected_flags if any(exp in fl for fl in all_flags))
+        self.assertGreaterEqual(
+            found_count, 3,
+            f"Expected at least 3/7 flags, got {found_count}. Flags: {all_flags}"
+        )
+
+        # 4. Shellcode detection
+        shellcode_hits = res.get("shellcode_hits", [])
+        self.assertGreater(len(shellcode_hits), 0, "No shellcode detected in .lime")
+
+        # 5. VeraCrypt volume detected
+        crypto_vols = res.get("crypto_volumes", [])
+        self.assertGreater(len(crypto_vols), 0, "No VeraCrypt volume detected")
+
+        # 6. SAM hashes extracted
+        ntlm_hashes = res.get("ntlm_hashes", [])
+        self.assertGreater(len(ntlm_hashes), 0, "No SAM/NTLM hashes extracted")
+
+        print(f"  [OK] advanced_ctf.lime: {found_count}/7 flags, {len(shellcode_hits)} shellcode hits, {len(crypto_vols)} crypto vols")
 
 
 if __name__ == "__main__":

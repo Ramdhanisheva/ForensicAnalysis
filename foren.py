@@ -49,7 +49,7 @@ from core.system_inspector import SystemInspector
 from core.triage import Triage
 
 
-def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: str = "results") -> Dict[str, Any]:
+def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: str = "results", delime: bool = False) -> Dict[str, Any]:
     """Jalankan deteksi tipe soal dan eksekusi analisa forensik terarah."""
     file_path = os.path.abspath(filepath)
     if not os.path.exists(file_path):
@@ -379,6 +379,25 @@ def run_forensic_solver(filepath: str, stop_on_flag: bool = True, output_base: s
         # B. MEMORY DUMP
         elif "Memory" in detected_cat or file_size > 100 * 1024 * 1024:
             print(" [*] Menjalankan modul streaming memori RAM (Zero-OOM, sliding-window 32MB)...")
+
+            # --- Step B0: LiME Header & Physical Memory Range Triage ---
+            if header_sample.startswith((b"EMiL", b"LiME")) or file_path.lower().endswith(".lime"):
+                lime_ranges = memory_streamer.parse_lime_headers(file_path)
+                if lime_ranges:
+                    total_ram_mb = sum(r["size_mb"] for r in lime_ranges)
+                    print(f" [+] Format LiME Terverifikasi: {len(lime_ranges)} Rentang Memori Fisik ({total_ram_mb:,.1f} MB Total)")
+                    for lr in lime_ranges[:5]:
+                        print(f"     - Range #{lr['index']}: {lr['start_addr']} s/d {lr['end_addr']} ({lr['size_mb']} MB)")
+                    if len(lime_ranges) > 5:
+                        print(f"     ... ({len(lime_ranges) - 5} rentang memori fisik lainnya)")
+
+                    if delime:
+                        raw_out_path = os.path.join(target_out_dir, f"{os.path.splitext(file_name)[0]}.raw")
+                        print(f" [*] Melakukan De-LiME (Konversi ke Flat Physical RAM .raw)...")
+                        conv_res = memory_streamer.convert_lime_to_raw(file_path, raw_out_path)
+                        if conv_res.get("success"):
+                            print(f" [+] Sukses De-LiME: {conv_res['total_bytes_written']:,} bytes tersimpan di {raw_out_path}")
+                            task_results["delime_raw"] = raw_out_path
 
             # --- Step B1: WSL strings + grep (paling cepat temukan flag) ---
             wsl_distros = ["kali-linux", "Ubuntu", "Debian"]
@@ -774,6 +793,7 @@ def main():
     )
     parser.add_argument("target", nargs="?", help="Path ke file soal forensik CTF yang ingin dianalisis")
     parser.add_argument("--no-stop", dest="stop_on_flag", action="store_false", default=True, help="Lakukan deep scan tuntas tanpa berhenti pada flag pertama")
+    parser.add_argument("--delime", action="store_true", help="Ekstrak / de-LiME format .lime menjadi raw physical RAM (.raw)")
     parser.add_argument("--outdir", default="results", help="Folder output hasil analisis (default: results)")
 
     args = parser.parse_args()
@@ -793,9 +813,9 @@ def main():
         for root, _, files in os.walk(target_path):
             for file in files:
                 p = os.path.join(root, file)
-                run_forensic_solver(p, stop_on_flag=args.stop_on_flag, output_base=args.outdir)
+                run_forensic_solver(p, stop_on_flag=args.stop_on_flag, output_base=args.outdir, delime=args.delime)
     else:
-        run_forensic_solver(target_path, stop_on_flag=args.stop_on_flag, output_base=args.outdir)
+        run_forensic_solver(target_path, stop_on_flag=args.stop_on_flag, output_base=args.outdir, delime=args.delime)
 
 
 if __name__ == "__main__":

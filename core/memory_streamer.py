@@ -5,6 +5,7 @@ and Windows (.dmp, .raw, .vmem) memory dumps.
 Never freezes, never exhausts RAM, extracts bash history, env vars, and flags.
 """
 
+import base64
 import os
 import re
 import shutil
@@ -32,6 +33,128 @@ class MemoryStreamer:
         elif header_bytes.startswith(b"PAGE") or header_bytes.startswith(b"MDMP"):
             return {"type": "Windows Minidump / Crash Dump", "os": "windows", "magic": "Windows Dump"}
         return {"type": "Raw Memory Image / Dump", "os": "unknown", "magic": "Raw"}
+
+    def parse_lime_headers(self, filepath: str) -> List[Dict[str, Any]]:
+        """
+        Parses all physical memory range headers in a Linux LiME (.lime) dump.
+        LiME Header struct (32 bytes):
+        - magic (4 bytes): 0x4c694d45 (b"EMiL") or b"LiME"
+        - version (4 bytes): uint32 (typically 1)
+        - start (8 bytes): uint64 physical start address
+        - end (8 bytes): uint64 physical end address
+        - reserved (8 bytes): padding
+        """
+        ranges: List[Dict[str, Any]] = []
+        if not os.path.exists(filepath):
+            return ranges
+
+        file_size = os.path.getsize(filepath)
+        try:
+            with open(filepath, "rb") as f:
+                pos = 0
+                range_idx = 0
+                while pos + 32 <= file_size:
+                    f.seek(pos)
+                    hdr = f.read(32)
+                    if len(hdr) < 32:
+                        break
+
+                    magic = hdr[:4]
+                    if magic not in (b"EMiL", b"LiME"):
+                        break
+
+                    endian = "<" if magic == b"EMiL" else ">"
+                    version, start, end = struct.unpack(f"{endian}IQQ", hdr[4:24])
+
+                    if end < start or (end - start + 1) > file_size:
+                        break
+
+                    block_size = end - start + 1
+                    ranges.append({
+                        "index": range_idx,
+                        "version": version,
+                        "header_offset": hex(pos),
+                        "data_offset": hex(pos + 32),
+                        "start_addr": hex(start),
+                        "end_addr": hex(end),
+                        "size_bytes": block_size,
+                        "size_mb": round(block_size / (1024 * 1024), 2)
+                    })
+
+                    range_idx += 1
+                    pos += 32 + block_size
+        except Exception:
+            pass
+
+        return ranges
+
+    def convert_lime_to_raw(
+        self,
+        filepath: str,
+        output_raw_path: str,
+        linear_pad: bool = False,
+        progress_callback: Optional[Callable[[int, int], None]] = None
+    ) -> Dict[str, Any]:
+        """
+        De-LiME: Extracts/flattens LiME dump into standard continuous raw physical RAM (.raw / .dd).
+        - If linear_pad=True: preserves exact physical RAM addresses by seeking to start_addr
+          (sparse file / zero padded gaps).
+        - If linear_pad=False (default): strips all 32-byte LiME headers and concatenates
+          all memory chunks into a clean, compact raw image.
+        """
+        result = {
+            "success": False,
+            "ranges_extracted": 0,
+            "total_bytes_written": 0,
+            "output_path": output_raw_path,
+            "error": None
+        }
+
+        ranges = self.parse_lime_headers(filepath)
+        if not ranges:
+            result["error"] = "No valid LiME ranges detected or file is already raw memory."
+            return result
+
+        try:
+            with open(filepath, "rb") as fin, open(output_raw_path, "wb") as fout:
+                total_written = 0
+                total_data = sum(r["size_bytes"] for r in ranges)
+
+                for r in ranges:
+                    hdr_off = int(r["header_offset"], 16)
+                    start_addr = int(r["start_addr"], 16)
+                    size = r["size_bytes"]
+
+                    if linear_pad:
+                        current_out = fout.tell()
+                        if current_out < start_addr:
+                            gap = start_addr - current_out
+                            fout.write(b"\x00" * min(gap, 1024 * 1024))
+                            if gap > 1024 * 1024:
+                                fout.seek(start_addr)
+
+                    fin.seek(hdr_off + 32)
+                    remaining = size
+                    while remaining > 0:
+                        chunk_to_read = min(remaining, 16 * 1024 * 1024)
+                        buf = fin.read(chunk_to_read)
+                        if not buf:
+                            break
+                        fout.write(buf)
+                        remaining -= len(buf)
+                        total_written += len(buf)
+                        if progress_callback:
+                            progress_callback(total_written, total_data)
+
+                result["success"] = True
+                result["ranges_extracted"] = len(ranges)
+                result["total_bytes_written"] = total_written
+
+        except Exception as e:
+            result["error"] = str(e)
+
+        return result
+
 
     def scan_memory_dump(
         self,
@@ -520,6 +643,226 @@ class MemoryStreamer:
                             results["web_ir_killchain"]["rce_parameters"].add(p_name)
                             if p_cmd not in results["web_ir_killchain"]["executed_commands"]:
                                 results["web_ir_killchain"]["executed_commands"].append(p_cmd)
+
+
+                    # 17. Windows Clipboard Content Recovery (MemLabs style)
+                    # Clipboard blocks in Windows RAM often preceded by CF_TEXT or CF_UNICODETEXT identifiers
+                    cb_matches = re.finditer(
+                        rb"(?:CF_TEXT|ClipboardData|clipbrd|\\x00C\\x00F\\x00_\\x00T|CLIPDATA)\x00{0,8}([A-Za-z0-9+/=_\-\.!\?\s\{\}@#$%^&*]{6,200})",
+                        current_buffer,
+                        re.IGNORECASE
+                    )
+                    for cbm in cb_matches:
+                        cb_str = cbm.group(1).decode("latin-1", errors="ignore").strip()
+                        if cb_str and self.string_hunter.is_valid_flag(cb_str):
+                            cb_fl = {
+                                "flag": cb_str,
+                                "encoding": "Windows Clipboard (CF_TEXT)",
+                                "context": f"[Clipboard @ 0x{chunk_offset + cbm.start():x}]"
+                            }
+                            if not any(f["flag"] == cb_str for f in results["flags_found"]):
+                                results["flags_found"].append(cb_fl)
+                                if on_flag_found:
+                                    on_flag_found(cb_fl)
+                        # Also hunt flags in clipboard-adjacent text
+                        for fl in self.string_hunter.hunt_flags(cb_str):
+                            fl["encoding"] = f"Clipboard/{fl['encoding']}"
+                            fl["context"] = f"[Clipboard @ 0x{chunk_offset + cbm.start():x}] {fl.get('context', '')}"
+                            if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                                results["flags_found"].append(fl)
+                                if on_flag_found:
+                                    on_flag_found(fl)
+
+                    # 18. Windows SAM / LSASS hashdump format (hashdump / secretsdump output in memory)
+                    # Format: Username:RID:LMHash:NTLMHash:::
+                    sam_matches = re.finditer(
+                        rb"([A-Za-z0-9_\.\-]{1,30}):(\\d{3,6}):([0-9a-fA-F]{32}):([0-9a-fA-F]{32}):::",
+                        current_buffer
+                    )
+                    for sm in sam_matches:
+                        user = sm.group(1).decode("ascii", errors="ignore")
+                        rid  = sm.group(2).decode("ascii")
+                        lm   = sm.group(3).decode("ascii")
+                        ntlm = sm.group(4).decode("ascii")
+                        sam_entry = f"{user}:{rid}:{lm}:{ntlm}:::"
+                        if sam_entry not in results["ntlm_hashes"]:
+                            results["ntlm_hashes"].append(sam_entry)
+
+                    # Also grab lsadump::sam style output (impacket secretsdump)
+                    lsa_matches = re.finditer(
+                        rb"([A-Za-z0-9_\.\-]{1,30})\s+\[.*?\]\s+Hash NTLM:\s+([0-9a-fA-F]{32})",
+                        current_buffer,
+                        re.IGNORECASE
+                    )
+                    for lm in lsa_matches:
+                        user2 = lm.group(1).decode("ascii", errors="ignore").strip()
+                        ntlm2 = lm.group(2).decode("ascii")
+                        entry2 = f"[LSA] {user2} -> NTLM:{ntlm2}"
+                        if entry2 not in results["ntlm_hashes"]:
+                            results["ntlm_hashes"].append(entry2)
+
+                    # 19. PowerShell Encoded Command Decoder (common CTF obfuscation)
+                    # Finds -EncodedCommand / -enc / -e base64 blocks and decodes UTF-16LE
+                    ps_enc_matches = re.finditer(
+                        rb"(?:-EncodedCommand|-enc|-e)\s+([A-Za-z0-9+/=]{20,4096})",
+                        current_buffer,
+                        re.IGNORECASE
+                    )
+                    for psm in ps_enc_matches:
+                        b64_blob = psm.group(1).decode("ascii", errors="ignore").strip()
+                        try:
+                            import base64 as _b64
+                            # PowerShell uses UTF-16LE encoding
+                            pad_len = (4 - len(b64_blob) % 4) % 4
+                            raw_ps = _b64.b64decode(b64_blob + "=" * pad_len)
+                            decoded_ps = raw_ps.decode("utf-16-le", errors="ignore")
+                            # Hunt flags in decoded PowerShell
+                            for fl in self.string_hunter.hunt_flags(decoded_ps):
+                                fl["encoding"] = f"PowerShell-EncodedCmd/{fl['encoding']}"
+                                fl["context"] = f"[PS Encoded @ 0x{chunk_offset + psm.start():x}] {decoded_ps[:80]}..."
+                                if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                                    results["flags_found"].append(fl)
+                                    if on_flag_found:
+                                        on_flag_found(fl)
+                            # Store decoded command for review
+                            cmd_preview = decoded_ps[:200].replace("\n", " ").strip()
+                            if cmd_preview and cmd_preview not in seen_commands:
+                                seen_commands.add(cmd_preview)
+                                results["bash_commands"].append(f"[PS-Decoded] {cmd_preview}")
+                        except Exception:
+                            pass
+
+                    # 20. Shellcode / Process Injection Malfind-Style Detection
+                    # Common x86-64 shellcode stubs: MZ header in RWX region, or NOP sleds + push/ret
+                    shellcode_signatures = [
+                        (bytes([0x4d, 0x5a, 0x90, 0x00]), "PE-in-Memory (MZ header injected)"),
+                        (bytes([0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0xfc, 0xe8]), "NOP sled + shellcode preamble"),
+                        (bytes([0x60, 0x89, 0xe5, 0x31, 0xc0]), "x86 GetEIP stub"),
+                        (bytes([0x48, 0x31, 0xc9, 0x48, 0x81, 0xe9]), "x64 shellcode XOR decode loop"),
+                        (bytes([0xfc, 0x48, 0x83, 0xe4, 0xf0]), "Metasploit x64 shellcode preamble"),
+                        (bytes([0x31, 0xdb, 0x64, 0x8b, 0x43, 0x30]), "PEB Walk (process enumeration)"),
+                    ]
+                    if "shellcode_hits" not in results:
+                        results["shellcode_hits"] = []
+                    for sig_bytes, sig_name in shellcode_signatures:
+                        sc_pos = 0
+                        while True:
+                            sc_idx = current_buffer.find(sig_bytes, sc_pos)
+                            if sc_idx == -1:
+                                break
+                            sc_pos = sc_idx + len(sig_bytes)
+                            abs_off = chunk_offset + sc_idx
+                            entry = {"offset": hex(abs_off), "signature": sig_name}
+                            if entry not in results["shellcode_hits"]:
+                                results["shellcode_hits"].append(entry)
+                                print(f"    [!] [Malfind] {sig_name} @ 0x{abs_off:x}")
+                            if len(results["shellcode_hits"]) >= 20:
+                                break
+
+                    # 21. TrueCrypt / VeraCrypt Volume Header Detection
+                    # First 64 bytes of TrueCrypt header = random salt; byte 64-67 = signature
+                    if "crypto_volumes" not in results:
+                        results["crypto_volumes"] = []
+                    vc_pos = 0
+                    while True:
+                        # VeraCrypt magic at offset 64 from sector start: b'VERA'
+                        # TrueCrypt: b'\x54\x52\x55\x45' at offset 64
+                        tc_idx = current_buffer.find(b"TRUE", vc_pos)
+                        vc_idx = current_buffer.find(b"VERA", vc_pos)
+                        idx_cands = [i for i in (tc_idx, vc_idx) if i != -1]
+                        if not idx_cands:
+                            break
+                        found_idx = min(idx_cands)
+                        found_magic = current_buffer[found_idx:found_idx+4].decode("ascii")
+                        vc_pos = found_idx + 4
+                        # The magic should be at offset 64 within a 512-byte sector
+                        sector_offset = found_idx - 64
+                        if sector_offset < 0:
+                            continue
+                        abs_vc_off = chunk_offset + sector_offset
+                        entry_vc = {"offset": hex(abs_vc_off), "type": f"{found_magic} Encrypted Volume Header"}
+                        if entry_vc not in results["crypto_volumes"]:
+                            results["crypto_volumes"].append(entry_vc)
+                            print(f"    [!] [{found_magic}] Encrypted volume header @ 0x{abs_vc_off:x}")
+
+                    # 22. Steganography LSB Hint / Watermark Pattern Scanner
+                    # Flags sometimes hidden as filenames, comments, or coordinates in image dumps
+                    steg_patterns = [
+                        (rb"Steg(?:anograph)?(?:y|ied)[^\\r\\n\\x00]{0,20}([A-Za-z0-9+/=]{10,80})", "Steg comment"),
+                        (rb"(?:LSB|lsb)(?:\s+data|\s+message|\s+payload)[^\\r\\n\\x00]{0,20}([A-Za-z0-9+/=]{10,80})", "LSB data"),
+                        (rb"(?:steghide|outguess|openstego|stegsolve)[^\\r\\n\\x00]{0,30}([A-Za-z0-9_\\-\\.]{4,60})", "Steg tool ref"),
+                        (rb"Comment:\s+([A-Za-z0-9+/=_\-\.\{\}]{6,80})", "JPEG/PNG Comment field"),
+                        (rb"iTXt.*?([A-Za-z0-9+/=_\-\.\{\}]{6,80})", "PNG iTXt chunk"),
+                    ]
+                    for steg_pat, steg_label in steg_patterns:
+                        for sm_match in re.finditer(steg_pat, current_buffer, re.IGNORECASE | re.DOTALL):
+                            sg_str = sm_match.group(1).decode("latin-1", errors="ignore").strip()
+                            for fl in self.string_hunter.hunt_flags(sg_str):
+                                fl["encoding"] = f"Steg-Hint({steg_label})/{fl['encoding']}"
+                                fl["context"] = f"[Steg @ 0x{chunk_offset + sm_match.start():x}] {fl.get('context', '')}"
+                                if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                                    results["flags_found"].append(fl)
+                                    if on_flag_found:
+                                        on_flag_found(fl)
+
+                    # 23. Network Plaintext Credential Recovery (FTP/SMTP/POP3/IMAP in RAM)
+                    net_cred_patterns = [
+                        (rb"USER\s+([A-Za-z0-9_@\.\-]{3,40})\r\n(?:PASS|PASSWORD)\s+([^\r\n]{3,60})", "FTP/POP3"),
+                        (rb"AUTH LOGIN\r\n([A-Za-z0-9+/=]{4,80})\r\n([A-Za-z0-9+/=]{4,80})", "SMTP AUTH LOGIN"),
+                        (rb"AUTH PLAIN\s+([A-Za-z0-9+/=]{6,200})", "SMTP AUTH PLAIN"),
+                        (rb"(?:username|user)=([^&\s\r\n]{3,40})&(?:password|pass|pwd)=([^\s\r\n&]{3,60})", "HTTP POST login"),
+                        (rb"Authorization:\s+Basic\s+([A-Za-z0-9+/=]{6,120})", "HTTP Basic Auth"),
+                    ]
+                    if "network_credentials" not in results:
+                        results["network_credentials"] = []
+                    for nc_pat, nc_label in net_cred_patterns:
+                        for nc_match in re.finditer(nc_pat, current_buffer, re.IGNORECASE):
+                            try:
+                                if nc_label in ("SMTP AUTH PLAIN", "HTTP Basic Auth"):
+                                    import base64 as _b64
+                                    blob = nc_match.group(1).decode("ascii", errors="ignore")
+                                    pad = (4 - len(blob) % 4) % 4
+                                    dec = _b64.b64decode(blob + "=" * pad).decode("latin-1", errors="ignore")
+                                    cred_str = f"[{nc_label}] Decoded: {dec[:100]}"
+                                else:
+                                    user_part = nc_match.group(1).decode("latin-1", errors="ignore").strip()
+                                    pass_part = nc_match.group(2).decode("latin-1", errors="ignore").strip()
+                                    cred_str = f"[{nc_label}] {user_part} : {pass_part}"
+                                if cred_str not in results["network_credentials"]:
+                                    results["network_credentials"].append(cred_str)
+                                    # Try to find flag-shaped passwords
+                                    for fl in self.string_hunter.hunt_flags(cred_str):
+                                        fl["encoding"] = f"NetCred/{fl['encoding']}"
+                                        if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                                            results["flags_found"].append(fl)
+                                            if on_flag_found:
+                                                on_flag_found(fl)
+                            except Exception:
+                                pass
+
+                    # 24. Suspicious Registry Key / Windows Artifact Scanner
+                    # Common CTF technique: flag stored in registry Run key, HKLM\\SOFTWARE path, etc.
+                    reg_patterns = [
+                        (rb"HKEY_(?:LOCAL_MACHINE|CURRENT_USER|USERS|CLASSES_ROOT)\\[^\x00\r\n]{5,120}", "Registry key path"),
+                        (rb"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run[^\x00\r\n]{0,100}", "Registry Run key"),
+                        (rb"(?:nk|vk|lk)\x00{0,4}([A-Za-z0-9_\-\.]{3,40})\x00{0,4}([A-Za-z0-9+/=_\-\.\{\}]{6,120})", "Reg hive nk/vk record"),
+                    ]
+                    if "registry_artifacts" not in results:
+                        results["registry_artifacts"] = []
+                    for rp_pat, rp_label in reg_patterns:
+                        for rp_match in re.finditer(rp_pat, current_buffer, re.IGNORECASE):
+                            reg_str = rp_match.group(0).decode("latin-1", errors="ignore").strip()
+                            if reg_str and len(reg_str) > 5 and reg_str not in results["registry_artifacts"]:
+                                results["registry_artifacts"].append(reg_str)
+                            # Hunt flags in registry values
+                            for fl in self.string_hunter.hunt_flags(reg_str):
+                                fl["encoding"] = f"Registry({rp_label})/{fl['encoding']}"
+                                fl["context"] = f"[Reg @ 0x{chunk_offset + rp_match.start():x}]"
+                                if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                                    results["flags_found"].append(fl)
+                                    if on_flag_found:
+                                        on_flag_found(fl)
+
 
                     prev_overlap = chunk[-self.overlap:] if len(chunk) >= self.overlap else chunk
 
