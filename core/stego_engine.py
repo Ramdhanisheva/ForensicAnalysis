@@ -63,15 +63,20 @@ class StegoEngine:
         if not data:
             return results
 
-        # 0. Check for corrupted PNG magic header/trailer (Magic Show pattern)
-        if b"IHDR" in data[:64] and not data.startswith(b"\x89PNG\r\n\x1a\n"):
-            fixed_png = self.repair_corrupted_png_magic(data)
+        # 0. Check for corrupted PNG (magic header, chunk names like C"DR, lengths, CRCs)
+        is_png_tampered = (
+            (b"IHDR" in data[:64] or b'C"DR' in data[:64] or (len(data) > 16 and data[8:12] == b"\x00\x00\x00\x0d"))
+            and not data.startswith(b"\x89PNG\r\n\x1a\n")
+        )
+        if is_png_tampered or (data.startswith(b"\x89PNG") and b'C"DR' in data[:64]):
+            fixed_png = self.repair_corrupted_png(data)
             if fixed_png:
-                results["anomalies"].append("Repaired corrupted PNG magic header/trailer")
+                results["anomalies"].append("Repaired corrupted PNG header/chunks/CRCs (c0rrupt pattern)")
                 data = fixed_png
-                # Scan repaired QR code
-                qr_flags = self.scan_qr_code_from_bytes(data)
-                results["flags_found"].extend(qr_flags)
+                # Scan repaired image with QR and OCR
+                results["flags_found"].extend(self.scan_qr_code_from_bytes(data))
+                repaired_png_path = os.path.join(self.output_dir, "repaired_png.png")
+                results["flags_found"].extend(self.run_ocr_on_file(repaired_png_path))
 
         # 1. Standard QR code scan on image
         qr_flags = self.scan_qr_code_from_bytes(data)
@@ -91,6 +96,9 @@ class StegoEngine:
             if target_path:
                 zsteg_flags = self.run_zsteg_on_file(target_path)
                 results["flags_found"].extend(zsteg_flags)
+                # Run OCR on target image
+                ocr_flags = self.run_ocr_on_file(target_path)
+                results["flags_found"].extend(ocr_flags)
 
         # 3. JPEG DQT & Height Tampering
         elif data.startswith(b"\xff\xd8\xff"):
@@ -101,34 +109,245 @@ class StegoEngine:
             if target_path:
                 height_fixes = self.explore_jpeg_height(data, target_path)
                 results["anomalies"].extend(height_fixes)
+                ocr_flags = self.run_ocr_on_file(target_path)
+                results["flags_found"].extend(ocr_flags)
 
-        # 4. BMP & Raw Pixels
+        # 4. BMP & Raw Pixels + tunn3l v1s10n repair
         elif data.startswith(b"BM"):
+            # Check for corrupted BMP header or truncated height (tunn3l v1s10n pattern)
+            repaired_bmp_bytes, bmp_anomalies = self.repair_corrupted_bmp(data, target_path)
+            if bmp_anomalies:
+                results["anomalies"].extend(bmp_anomalies)
+            if repaired_bmp_bytes:
+                data = repaired_bmp_bytes
+                base_name = os.path.basename(target_path) if target_path else "sample"
+                repaired_bmp_path = os.path.join(self.output_dir, f"repaired_bmp_{base_name}.bmp")
+                ocr_flags = self.run_ocr_on_file(repaired_bmp_path)
+                results["flags_found"].extend(ocr_flags)
+
             bmp_res = self.analyze_bmp_or_raw_pixels(data)
             results["flags_found"].extend(bmp_res.get("extracted_flags", []))
+            if target_path:
+                ocr_flags = self.run_ocr_on_file(target_path)
+                results["flags_found"].extend(ocr_flags)
+
+        # 5. SVG Image Triage (<tspan> coordinates & base64 embeds)
+        elif b"<svg" in data[:500] or (data.startswith(b"<?xml") and b"<svg" in data[:1000]):
+            svg_res = self.analyze_svg(data)
+            results["flags_found"].extend(svg_res.get("flags_found", []))
+            results["flags_found"].extend(svg_res.get("extracted_flags", []))
+            results["anomalies"].extend(svg_res.get("anomalies", []))
 
         return results
 
-    def repair_corrupted_png_magic(self, data: bytes) -> Optional[bytes]:
-        """Detect and repair tampered PNG magic header (e.g. \x89@K0...) and trailer (IUND -> IEND)."""
+    def repair_corrupted_png(self, data: bytes) -> Optional[bytes]:
+        """
+        Detect and repair tampered PNGs (PicoCTF 'c0rrupt' / Magic Show patterns):
+        - Fix corrupted magic header (\x89PNG\r\n\x1a\n)
+        - Fix corrupted chunk headers (e.g. C"DR -> IHDR)
+        - Fix corrupted chunk lengths (e.g. pHYs length must be 9)
+        - Recalculate corrupted CRCs
+        - Append missing or corrupted IEND trailer
+        """
         try:
-            ihdr_pos = data.find(b"IHDR")
-            if ihdr_pos == -1 or ihdr_pos > 32:
-                return None
             fixed = bytearray(data)
+            # 1. Force valid PNG 8-byte magic
             fixed[0:8] = b"\x89PNG\r\n\x1a\n"
-            # Fix IEND trailer if corrupted
-            for corrupted_trailer in (b"IUND", b"1END", b"iEND", b"IEnd"):
-                t_pos = fixed.rfind(corrupted_trailer)
-                if t_pos != -1 and t_pos >= len(fixed) - 32:
-                    fixed[t_pos:t_pos+4] = b"IEND"
-            # Save repaired image artifact
-            repaired_out = os.path.join(self.output_dir, "repaired_png_magic.png")
+
+            # 2. Fix 1st chunk (must be IHDR with length 13)
+            if len(fixed) >= 29:
+                fixed[8:12] = b"\x00\x00\x00\x0d"
+                fixed[12:16] = b"IHDR"
+                ihdr_data = fixed[16:29]
+                ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xffffffff
+                fixed[29:33] = struct.pack(">I", ihdr_crc)
+
+            # 3. Walk remaining chunks
+            pos = 33
+            standard_chunks = [b"PLTE", b"IDAT", b"IEND", b"pHYs", b"sBIT", b"sRGB", b"gAMA", b"cHRM", b"tEXt", b"zTXt", b"iTXt", b"tIME", b"bKGD", b"hIST"]
+            
+            while pos < len(fixed) - 8:
+                length = struct.unpack(">I", fixed[pos:pos+4])[0]
+                chunk_type = bytes(fixed[pos+4:pos+8])
+
+                # Corrupted pHYs (often precedes IDAT)
+                if chunk_type not in standard_chunks:
+                    if b"IDAT" in fixed[pos:pos+64]:
+                        idat_next = fixed.find(b"IDAT", pos)
+                        if idat_next - 4 == pos + 21 or (idat_next > pos and idat_next - pos <= 32):
+                            fixed[pos:pos+4] = b"\x00\x00\x00\x09"
+                            fixed[pos+4:pos+8] = b"pHYs"
+                            phys_crc = zlib.crc32(b"pHYs" + fixed[pos+8:pos+17]) & 0xffffffff
+                            fixed[pos+17:pos+21] = struct.pack(">I", phys_crc)
+                            pos = pos + 21
+                            continue
+                    # Test if any known chunk matches CRC
+                    if pos + 8 + length + 4 <= len(fixed):
+                        c_data = fixed[pos+8:pos+8+length]
+                        c_crc = struct.unpack(">I", fixed[pos+8+length:pos+12+length])[0]
+                        matched_chunk = None
+                        for sc in standard_chunks:
+                            if (zlib.crc32(sc + c_data) & 0xffffffff) == c_crc:
+                                matched_chunk = sc
+                                break
+                        if matched_chunk:
+                            fixed[pos+4:pos+8] = matched_chunk
+                            pos += 12 + length
+                            continue
+
+                # Recalculate CRC for known chunks
+                if chunk_type in standard_chunks and pos + 8 + length + 4 <= len(fixed):
+                    c_data = fixed[pos+8:pos+8+length]
+                    actual_crc = zlib.crc32(chunk_type + c_data) & 0xffffffff
+                    fixed[pos+8+length:pos+12+length] = struct.pack(">I", actual_crc)
+                    pos += 12 + length
+                    if chunk_type == b"IEND":
+                        break
+                else:
+                    pos += 1
+
+            # 4. Ensure valid IEND trailer
+            if not fixed.endswith(b"IEND\xaeB`\x82"):
+                iend_idx = fixed.rfind(b"IEND")
+                if iend_idx != -1 and iend_idx >= len(fixed) - 32:
+                    fixed[iend_idx-4:iend_idx] = b"\x00\x00\x00\x00"
+                    fixed[iend_idx:iend_idx+4] = b"IEND"
+                    fixed[iend_idx+4:iend_idx+8] = b"\xaeB`\x82"
+                    fixed = fixed[:iend_idx+8]
+                else:
+                    fixed += b"\x00\x00\x00\x00IEND\xaeB`\x82"
+
+            repaired_out = os.path.join(self.output_dir, "repaired_png.png")
             with open(repaired_out, "wb") as f:
                 f.write(fixed)
             return bytes(fixed)
         except Exception:
             return None
+
+    def repair_corrupted_png_magic(self, data: bytes) -> Optional[bytes]:
+        """Detect and repair tampered PNG magic header and trailer."""
+        return self.repair_corrupted_png(data)
+
+    def repair_corrupted_bmp(self, data: bytes, target_path: Optional[str] = None) -> Tuple[Optional[bytes], List[str]]:
+        """
+        Detect and repair tampered BMP headers and vertical cropping (PicoCTF 'tunn3l v1s10n'):
+        - Fix corrupted pixel data offset (bytes 10-13)
+        - Fix corrupted DIB header size (bytes 14-17)
+        - Recalculate maximum true height from total byte capacity and expand cropped height
+        """
+        anomalies = []
+        if not data.startswith(b"BM") or len(data) < 54:
+            return None, anomalies
+
+        try:
+            fixed = bytearray(data)
+            file_size = struct.unpack("<I", fixed[2:6])[0]
+            if file_size == 0 or file_size > len(fixed):
+                file_size = len(fixed)
+                fixed[2:6] = struct.pack("<I", file_size)
+
+            pixel_offset = struct.unpack("<I", fixed[10:14])[0]
+            dib_size = struct.unpack("<I", fixed[14:18])[0]
+
+            repaired_header = False
+            # Fix corrupted DIB size (tunn3l v1s10n has 0xBAD0 instead of 40)
+            if dib_size not in (12, 40, 52, 56, 64, 108, 124):
+                fixed[14:18] = struct.pack("<I", 40)
+                dib_size = 40
+                repaired_header = True
+                anomalies.append("Repaired corrupted BMP DIB header size (reset to 40)")
+
+            # Fix corrupted pixel offset (tunn3l v1s10n has 0xBAD0 instead of 54)
+            if pixel_offset != 54 and dib_size == 40:
+                fixed[10:14] = struct.pack("<I", 54)
+                pixel_offset = 54
+                repaired_header = True
+                anomalies.append("Repaired corrupted BMP pixel data offset (reset to 54)")
+
+            width = abs(struct.unpack("<i", fixed[18:22])[0])
+            height = abs(struct.unpack("<i", fixed[22:26])[0])
+            bpp = struct.unpack("<H", fixed[28:30])[0]
+
+            if bpp not in (1, 4, 8, 16, 24, 32):
+                bpp = 24
+                fixed[28:30] = struct.pack("<H", 24)
+
+            row_size = ((width * bpp + 31) // 32) * 4
+            if row_size > 0:
+                data_capacity = len(fixed) - pixel_offset
+                max_height = data_capacity // row_size
+
+                if max_height > height:
+                    anomalies.append(f"BMP height tampering detected: header has {height}px, payload contains data for {max_height}px")
+                    fixed[22:26] = struct.pack("<i", max_height)
+                    repaired_header = True
+
+            if repaired_header:
+                base_name = os.path.basename(target_path) if target_path else "sample"
+                out_path = os.path.join(self.output_dir, f"repaired_bmp_{base_name}.bmp")
+                with open(out_path, "wb") as f:
+                    f.write(fixed)
+                anomalies.append(f"Saved repaired full-height BMP: {out_path}")
+                return bytes(fixed), anomalies
+        except Exception:
+            pass
+
+        return None, anomalies
+
+    def run_ocr_on_file(self, img_path: str) -> List[Dict[str, str]]:
+        """Run OCR on image file using tesseract via WSL Kali Linux across multiple PSM modes."""
+        flags: List[Dict[str, str]] = []
+        if not os.path.exists(img_path):
+            return flags
+        try:
+            wsl_p = to_wsl_path(img_path)
+            for psm in ("6", "3", "11"):
+                cmd = ["wsl", "-u", "root", "-d", "kali-linux", "tesseract", wsl_p, "stdout", "--psm", psm]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                if proc.stdout:
+                    for fl in self.string_hunter.hunt_flags(proc.stdout):
+                        fl["encoding"] = f"OCR Tesseract PSM {psm} ({fl['encoding']})"
+                        if not any(f["flag"] == fl["flag"] for f in flags):
+                            flags.append(fl)
+                if flags:
+                    break
+        except Exception:
+            pass
+        return flags
+
+    def analyze_svg(self, data: bytes) -> Dict[str, Any]:
+        """
+        Analyze SVG image files:
+        - Extract text from <tspan> and <text> sorted by coordinate or order
+        - Extract embedded Base64 raster images (PNG/JPG data URIs)
+        - Hunt flags in SVG comments, metadata, and CSS styles
+        """
+        results: Dict[str, Any] = {"extracted_flags": [], "anomalies": []}
+        try:
+            svg_text = data.decode("utf-8", errors="ignore")
+            for fl in self.string_hunter.hunt_flags(svg_text):
+                fl["encoding"] = f"SVG Source ({fl['encoding']})"
+                results["extracted_flags"].append(fl)
+
+            # Extract and concatenate <tspan> elements
+            tspans = re.findall(r'<tspan[^>]*>(.*?)</tspan>', svg_text, re.DOTALL)
+            if tspans:
+                joined_tspans = "".join(t.strip() for t in tspans if t.strip())
+                for fl in self.string_hunter.hunt_flags(joined_tspans):
+                    fl["encoding"] = f"SVG <tspan> Assembled ({fl['encoding']})"
+                    results["extracted_flags"].append(fl)
+
+            # Extract embedded Base64 images
+            for m_b64 in re.finditer(r'data:image/(?:png|jpeg|jpg);base64,([A-Za-z0-9+/=]+)', svg_text):
+                try:
+                    img_bytes = base64.b64decode(m_b64.group(1))
+                    img_res = self.audit_image_steganography(img_bytes)
+                    results["extracted_flags"].extend(img_res.get("flags_found", []))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return results
 
     def scan_qr_code_from_bytes(self, image_data: bytes) -> List[Dict[str, str]]:
         """Decode QR codes / barcodes using zbarimg via WSL or pyzbar."""

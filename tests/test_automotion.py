@@ -1205,6 +1205,143 @@ class TestAutomotionForensics(unittest.TestCase):
 
         print(f"  [OK] advanced_ctf.lime: {found_count}/7 flags, {len(shellcode_hits)} shellcode hits, {len(crypto_vols)} crypto vols")
 
+    def test_picoctf_event_viewing_evtx_fragment_reassembly(self):
+        """Test PicoCTF 'Event Viewing' Windows Event Log multi-event Base64 fragment reassembly."""
+        # Simulated EVTX raw stream containing 3 events with Base64 payloads:
+        # Event 1033 (MsiInstaller): cGljb0NURntFdjNudF92aTN3djNyXw== -> picoCTF{Ev3nt_vi3wv3r_
+        # Event 4657 (Registry):     MXNfYV9wcjN0dHlf                 -> 1s_a_pr3tty_
+        # Event 1074 (Shutdown):     dXMzZnVsX3QwMGxfODFiYTNmZTl9     -> us3ful_t00l_81ba3fe9}
+        simulated_log = (
+            "<Events>"
+            "<Event><System><EventID>1033</EventID><EventRecordID>101</EventRecordID></System>"
+            "<EventData><Data Name='Product'>Software Installed cGljb0NURntFdjNudF92aTN3djNyXw==</Data></EventData></Event>"
+            "<Event><System><EventID>4657</EventID><EventRecordID>102</EventRecordID></System>"
+            "<EventData><Data Name='OldValue'>0</Data><Data Name='NewValue'>MXNfYV9wcjN0dHlf</Data></EventData></Event>"
+            "<Event><System><EventID>1074</EventID><EventRecordID>103</EventRecordID></System>"
+            "<EventData><Data Name='Comment'>Shutdown reason dXMzZnVsX3QwMGxfODFiYTNmZTl9</Data></EventData></Event>"
+            "</Events>"
+        ).encode("utf-8")
+
+        res = self.sys.analyze_evtx_or_logs(simulated_log)
+        self.assertTrue(len(res["flags_found"]) > 0, "No flags recovered from multi-event log")
+        full_flag = "picoCTF{Ev3nt_vi3wv3r_1s_a_pr3tty_us3ful_t00l_81ba3fe9}"
+        self.assertTrue(
+            any(full_flag in fl["flag"] for fl in res["flags_found"]),
+            f"Expected reassembled flag {full_flag}, got: {res['flags_found']}"
+        )
+
+    def test_picoctf_tunnel_vision_bmp_height_and_header_repair(self):
+        """Test PicoCTF 'tunn3l v1s10n' corrupted BMP header and vertical height expansion."""
+        # Create a BMP with corrupted pixel offset (0xBAD0), corrupted DIB size (0xBAD0), and cropped height
+        width = 100
+        cropped_height = 5
+        actual_height = 20
+        bpp = 24
+        row_size = ((width * bpp + 31) // 32) * 4
+        pixel_payload = b"\xaa" * (row_size * actual_height)
+
+        bmp_head = bytearray(54)
+        bmp_head[0:2] = b"BM"
+        struct.pack_into("<I", bmp_head, 2, 54 + len(pixel_payload))
+        # Corrupt data offset to 0xBAD0 (47824)
+        struct.pack_into("<I", bmp_head, 10, 0xBAD0)
+        # Corrupt DIB header size to 0xBAD0 (47824)
+        struct.pack_into("<I", bmp_head, 14, 0xBAD0)
+        struct.pack_into("<i", bmp_head, 18, width)
+        struct.pack_into("<i", bmp_head, 22, cropped_height)  # Cropped!
+        struct.pack_into("<H", bmp_head, 26, 1)
+        struct.pack_into("<H", bmp_head, 28, bpp)
+        struct.pack_into("<I", bmp_head, 30, 0)
+        struct.pack_into("<I", bmp_head, 34, len(pixel_payload))
+
+        corrupted_bmp = bytes(bmp_head) + pixel_payload
+        repaired_bmp, anomalies = self.stego.repair_corrupted_bmp(corrupted_bmp)
+
+        self.assertIsNotNone(repaired_bmp, "Failed to repair corrupted BMP")
+        # Check repaired headers
+        rep_offset = struct.unpack("<I", repaired_bmp[10:14])[0]
+        rep_dib = struct.unpack("<I", repaired_bmp[14:18])[0]
+        rep_height = struct.unpack("<i", repaired_bmp[22:26])[0]
+
+        self.assertEqual(rep_offset, 54, "Pixel offset was not repaired to 54")
+        self.assertEqual(rep_dib, 40, "DIB size was not repaired to 40")
+        self.assertEqual(rep_height, actual_height, f"Height was not expanded to true height {actual_height}")
+        self.assertTrue(any("BMP height tampering" in a for a in anomalies))
+
+    def test_picoctf_c0rrupt_png_chunk_repair(self):
+        """Test PicoCTF 'c0rrupt' corrupted PNG magic bytes and chunk name repair."""
+        # Standard tiny 1x1 PNG
+        width, height = 1, 1
+        ihdr_content = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        ihdr_crc = zlib.crc32(b"IHDR" + ihdr_content) & 0xffffffff
+        idat_raw = zlib.compress(b"\x00\xff\x00\x00")
+        idat_crc = zlib.crc32(b"IDAT" + idat_raw) & 0xffffffff
+        iend_crc = zlib.crc32(b"IEND") & 0xffffffff
+
+        # Corrupt magic bytes and corrupt IHDR chunk type to C"DR
+        corrupted_png = bytearray()
+        corrupted_png.extend(b"\x89\x43\x42\x0a\r\n\x1a\n")  # Corrupted magic
+        corrupted_png.extend(struct.pack(">I", 13) + b'C"DR' + ihdr_content + struct.pack(">I", ihdr_crc))
+        corrupted_png.extend(struct.pack(">I", len(idat_raw)) + b"IDAT" + idat_raw + struct.pack(">I", idat_crc))
+        corrupted_png.extend(struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc))
+
+        repaired_png = self.stego.repair_corrupted_png(bytes(corrupted_png))
+        self.assertIsNotNone(repaired_png)
+        self.assertTrue(repaired_png.startswith(b"\x89PNG\r\n\x1a\n"), "Magic bytes were not restored")
+        self.assertIn(b"IHDR", repaired_png[:32], "IHDR chunk type was not restored from C\"DR")
+
+    def test_picoctf_matryoshka_doll_recursive_carving(self):
+        """Test PicoCTF 'Matryoshka doll' recursive embedded zip and image extraction."""
+        import io
+        import zipfile
+
+        # Innermost: zip with flag.txt
+        inner_buf = io.BytesIO()
+        with zipfile.ZipFile(inner_buf, "w") as zf_inner:
+            zf_inner.writestr("flag.txt", "picoCTF{matry0shka_d0ll_unv31l3d}")
+        inner_zip = inner_buf.getvalue()
+
+        # Middle: fake image with inner_zip appended
+        middle_img = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb\x00C\x00\xff\xd9" + inner_zip
+
+        # Outer: zip containing middle image
+        outer_buf = io.BytesIO()
+        with zipfile.ZipFile(outer_buf, "w") as zf_outer:
+            zf_outer.writestr("base_images/2_c.jpg", middle_img)
+        outer_zip = outer_buf.getvalue()
+
+        # Doll image: top level JPEG embedding outer_zip
+        doll_img = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xd9" + outer_zip
+
+        carved = self.carver.carve_embedded_files(doll_img, base_name="dolls")
+        all_flags = []
+        for c in carved:
+            all_flags.extend([f["flag"] for f in c.get("flags_found", [])])
+
+        self.assertTrue(
+            any("picoCTF{matry0shka_d0ll_unv31l3d}" in fl for fl in all_flags),
+            f"Matryoshka recursive carver failed to find nested flag. Flags found: {all_flags}"
+        )
+
+    def test_picoctf_svg_tspan_reassembly(self):
+        """Test PicoCTF SVG <tspan> coordinate / token reassembly."""
+        svg_content = (
+            "<svg xmlns='http://www.w3.org/2000/svg' width='400' height='100'>"
+            "<text x='10' y='50'>"
+            "<tspan x='10'>picoCTF{</tspan>"
+            "<tspan x='70'>svg_tspan_</tspan>"
+            "<tspan x='140'>scattered_</tspan>"
+            "<tspan x='210'>flag_found}</tspan>"
+            "</text>"
+            "</svg>"
+        ).encode("utf-8")
+
+        res = self.stego.audit_image_steganography(svg_content)
+        self.assertTrue(
+            any("picoCTF{svg_tspan_scattered_flag_found}" in fl["flag"] for fl in res["flags_found"]),
+            f"SVG triage did not assemble tspan flag: {res['flags_found']}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

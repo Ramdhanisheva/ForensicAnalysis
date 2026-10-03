@@ -91,9 +91,12 @@ class MagicCarver:
             }
         return None
 
-    def carve_embedded_files(self, data: bytes, base_name: str = "carved", candidate_passwords: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-        """Carve embedded files found at non-zero offsets with recursive unpack and PDF triage."""
+    def carve_embedded_files(self, data: bytes, base_name: str = "carved", candidate_passwords: Optional[List[str]] = None, _depth: int = 0) -> List[Dict[str, Any]]:
+        """Carve embedded files found at non-zero offsets with recursive unpack and PDF triage (PicoCTF Matryoshka doll solver)."""
         carved_files = []
+        if _depth > 6:
+            return carved_files
+
         carve_targets = [
             ("zip", b"PK\x03\x04", b"PK\x05\x06", 22),
             ("png", b"\x89PNG\r\n\x1a\n", b"IEND\xaeB`\x82", 8),
@@ -223,6 +226,18 @@ class MagicCarver:
                                             for fl in hunter.hunt_flags(e_bytes):
                                                 fl["source_file"] = fn
                                                 carved_info["flags_found"].append(fl)
+
+                                            # Recursive unpacking for Matryoshka nested images / archives
+                                            if _depth < 5 and (b"PK\x03\x04" in e_bytes[4:] or fn.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))):
+                                                nested_carves = self.carve_embedded_files(
+                                                    e_bytes,
+                                                    base_name=f"{base_name}_sub_{fn}",
+                                                    candidate_passwords=passwords_list,
+                                                    _depth=_depth + 1
+                                                )
+                                                for nc in nested_carves:
+                                                    carved_info["flags_found"].extend(nc.get("flags_found", []))
+                                                    carved_files.append(nc)
                                         except Exception:
                                             pass
 

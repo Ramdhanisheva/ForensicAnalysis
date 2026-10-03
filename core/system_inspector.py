@@ -60,8 +60,91 @@ class SystemInspector:
         else:
             return results
 
+        def _decode_candidate_b64(raw_token: str) -> List[str]:
+            token = raw_token.strip().strip("'\"")
+            if len(token) < 4:
+                return []
+            if not re.match(r"^[A-Za-z0-9+/\-_=]+$", token):
+                return []
+            pad = len(token) % 4
+            if pad != 0:
+                token += "=" * (4 - pad)
+            dec_list = []
+            for dec_fn in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    b_dec = dec_fn(token)
+                    # Try UTF-8
+                    try:
+                        s_u8 = b_dec.decode("utf-8")
+                        if s_u8 and all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in s_u8):
+                            if s_u8 not in dec_list:
+                                dec_list.append(s_u8)
+                    except Exception:
+                        pass
+                    # Try UTF-16LE
+                    try:
+                        s_u16 = b_dec.decode("utf-16le")
+                        if s_u16 and all(32 <= ord(c) <= 126 or c in "\r\n\t" for c in s_u16):
+                            if s_u16 not in dec_list:
+                                dec_list.append(s_u16)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            return dec_list
+
+        def _reassemble_fragments(fragments: List[Tuple[Any, str, str]]):
+            """
+            Multi-Event Fragment Reassembly:
+            Reconstructs flags split across multiple events (e.g. PicoCTF Event Viewing).
+            fragments: list of (order_idx, decoded_text, context_label)
+            """
+            # 1. Direct hunt on each individual decoded string
+            for _, txt, ctx in fragments:
+                for fl in self.string_hunter.hunt_flags(txt):
+                    fl["encoding"] = f"EVTX Decoded Payload ({fl['encoding']})"
+                    fl["context"] = f"{ctx}: {fl.get('context', '')}"
+                    if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                        results["flags_found"].append(fl)
+
+            # 2. Sequential / Forward Fragment Chaining
+            flag_start_pat = re.compile(r"([A-Za-z0-9_\-]+)\{([^\}\n\r\t]*)$")
+            for i, (k_i, txt_i, ctx_i) in enumerate(fragments):
+                m_start = flag_start_pat.search(txt_i)
+                if m_start:
+                    running_flag = txt_i[m_start.start():]
+                    contexts = [ctx_i]
+                    for j in range(i + 1, min(len(fragments), i + 20)):
+                        k_j, txt_j, ctx_j = fragments[j]
+                        running_flag += txt_j
+                        contexts.append(ctx_j)
+                        if "}" in txt_j:
+                            end_idx = running_flag.find("}") + 1
+                            full_cand = running_flag[:end_idx]
+                            for fl in self.string_hunter.hunt_flags(full_cand):
+                                fl["encoding"] = f"EVTX Multi-Event Fragment Reassembly ({fl['encoding']})"
+                                fl["context"] = f"Reassembled across {len(contexts)} events: {' -> '.join(contexts)}"
+                                if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                                    results["flags_found"].append(fl)
+                            break
+
+            # 3. Adjacent Raw Token Concatenations (in case Base64 string itself was split)
+            for i in range(len(fragments) - 1):
+                try:
+                    comb_txt = fragments[i][1] + fragments[i+1][1]
+                    for fl in self.string_hunter.hunt_flags(comb_txt):
+                        fl["encoding"] = f"EVTX Reassembled ({fl['encoding']})"
+                        fl["context"] = f"Combined {fragments[i][2]} + {fragments[i+1][2]}"
+                        if not any(f["flag"] == fl["flag"] for f in results["flags_found"]):
+                            results["flags_found"].append(fl)
+                except Exception:
+                    pass
+
         # 1. Native python-evtx parser if available and file starts with ElfFile\x00
         is_evtx = raw_bytes.startswith(b"ElfFile\x00") or (filepath and filepath.lower().endswith(".evtx"))
+        evtx_parsed_successfully = False
+        parsed_fragments: List[Tuple[Any, str, str]] = []
+
         if is_evtx and filepath:
             try:
                 import Evtx.Evtx as evtx_module
@@ -69,15 +152,25 @@ class SystemInspector:
                     _evtx_record_count = 0
                     for record in log.records():
                         _evtx_record_count += 1
-                        if _evtx_record_count > 20000:
+                        if _evtx_record_count > 25000:
                             break
                         xml_str = record.xml()
-                        # Event ID
+
+                        # Extract Event ID
+                        eid = "Unknown"
                         m_eid = re.search(r"<EventID[^>]*>(\d+)</EventID>", xml_str)
                         if m_eid:
                             eid = m_eid.group(1)
                             for target_eid, desc in [
-                                ("1102", "Audit log cleared"),
+                                ("1033", "Software Installation (MsiInstaller - CTF stage)"),
+                                ("4657", "Registry Value Modified (Audit Registry - CTF stage)"),
+                                ("1074", "System Shutdown / Restart initiated (CTF stage)"),
+                                ("7045", "New Service Installed"),
+                                ("4698", "Scheduled Task Created"),
+                                ("4624", "Logon Successful"),
+                                ("4625", "Logon Failed"),
+                                ("1102", "Audit log cleared (Anti-forensics)"),
+                                ("104", "System log cleared (Anti-forensics)"),
                                 ("4720", "User account created"),
                                 ("4781", "Account renamed"),
                                 ("1149", "RDP logon successful"),
@@ -87,6 +180,12 @@ class SystemInspector:
                                 if eid == target_eid and not any(k["event_id"] == eid for k in results["key_events"]):
                                     results["key_events"].append({"event_id": eid, "description": desc})
 
+                        # Extract Record ID & Timestamp
+                        rec_id = str(_evtx_record_count)
+                        m_rec = re.search(r"<EventRecordID[^>]*>(\d+)</EventRecordID>", xml_str)
+                        if m_rec:
+                            rec_id = m_rec.group(1)
+
                         # Extract HostApplication and CommandLine
                         for tag in ["HostApplication", "CommandLine", "ScriptBlockText", "Payload"]:
                             matches = re.findall(rf"<{tag}[^>]*>(.*?)</{tag}>", xml_str, re.DOTALL)
@@ -95,86 +194,98 @@ class SystemInspector:
                                 if clean_c and clean_c not in results["powershell_scripts"]:
                                     results["powershell_scripts"].append(clean_c)
 
-                        # Extract HostApplication= attribute patterns
                         for ha in re.findall(r"HostApplication=([^\r\n\t]+)", xml_str):
                             clean_ha = ha.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
                             if clean_ha and clean_ha not in results["powershell_scripts"]:
                                 results["powershell_scripts"].append(clean_ha)
 
+                        # Extract all <Data> and <EventData> payloads
+                        data_values = re.findall(r"<Data[^>]*>(.*?)</Data>", xml_str, re.DOTALL)
+                        for d_val in data_values:
+                            clean_val = d_val.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").strip()
+                            if clean_val:
+                                for dec_str in _decode_candidate_b64(clean_val):
+                                    parsed_fragments.append((int(rec_id) if rec_id.isdigit() else _evtx_record_count, dec_str, f"Event {eid} Rec {rec_id} Data"))
+
+                        # Check for Base64 tokens anywhere in XML string (e.g. PicoCTF Event Viewing)
+                        b64_tokens = re.findall(r"\b[A-Za-z0-9+/\-_]{8,}={0,2}\b", xml_str)
+                        for b64_tok in b64_tokens:
+                            for dec_str in _decode_candidate_b64(b64_tok):
+                                if not any(f[1] == dec_str for f in parsed_fragments):
+                                    parsed_fragments.append((int(rec_id) if rec_id.isdigit() else _evtx_record_count, dec_str, f"Event {eid} Rec {rec_id} Base64"))
+
                         # Check for -EncodedCommand in XML
                         for m_enc in re.finditer(r"(?:-enc|-encodedcommand)\s+([A-Za-z0-9+/=]{12,})", xml_str, re.IGNORECASE):
                             b64_val = m_enc.group(1)
-                            try:
-                                dec = base64.b64decode(b64_val).decode("utf-16le", errors="ignore").strip()
-                                if dec and dec not in results["decoded_commands"]:
+                            for dec in _decode_candidate_b64(b64_val):
+                                if dec not in results["decoded_commands"]:
                                     results["decoded_commands"].append(dec)
-                                    for fl in self.string_hunter.hunt_flags(dec):
-                                        fl["encoding"] = f"EVTX EncodedCommand ({fl['encoding']})"
-                                        results["flags_found"].append(fl)
-                                    # Also capture flag fragments like (part X/Y)
-                                    if "part" in dec.lower() or "{" in dec or "}" in dec:
-                                        results["flags_found"].append({
-                                            "flag": dec,
-                                            "encoding": "EVTX PowerShell Script Fragment",
-                                            "context": dec
-                                        })
-                            except Exception:
-                                pass
 
                         # Hunt flags directly in record XML
                         for fl in self.string_hunter.hunt_flags(xml_str):
                             fl["encoding"] = f"EVTX Record ({fl['encoding']})"
+                            fl["context"] = f"Event {eid} Rec {rec_id}: {fl.get('context', '')}"
                             results["flags_found"].append(fl)
+
+                    evtx_parsed_successfully = True
+                    _reassemble_fragments(parsed_fragments)
             except Exception:
                 pass
 
-        # 2. Raw Stream Scanner (Latin-1 and UTF-16LE)
-        texts_to_scan = [
-            raw_bytes.decode("latin-1", errors="ignore"),
-            raw_bytes.decode("utf-16le", errors="ignore")
-        ]
-
-        for text in texts_to_scan:
-            event_indicators = [
-                ("1102", "Audit log cleared (Anti-forensics indicator)"),
-                ("4720", "User account created"),
-                ("4781", "Account renamed"),
-                ("1149", "RDP logon successful"),
-                ("4104", "PowerShell Script Block execution"),
-                ("4688", "New process created")
+        # 2. Raw Stream Scanner (Latin-1 and UTF-16LE) - Runs if native parser found no flags or on non-evtx logs
+        if not results.get("flags_found"):
+            texts_to_scan = [
+                raw_bytes.decode("latin-1", errors="ignore"),
+                raw_bytes.decode("utf-16le", errors="ignore")
             ]
-            for eid, desc in event_indicators:
-                pattern = rf"(?:EventID>|EventID:?\s*){eid}\b"
-                if re.search(pattern, text) and not any(k["event_id"] == eid for k in results["key_events"]):
-                    results["key_events"].append({"event_id": eid, "description": desc})
 
-            # Extract PowerShell commands
-            ps_commands = re.findall(r"(?:powershell(?:\.exe)?|pwsh)\s+([^\r\n]{5,300})", text, re.IGNORECASE)
-            for cmd in set(ps_commands):
-                if cmd not in results["powershell_scripts"]:
-                    results["powershell_scripts"].append(cmd)
-                m_enc = re.search(r"(?:-enc|-encodedcommand)\s+([A-Za-z0-9+/=]{12,})", cmd, re.IGNORECASE)
-                if m_enc:
-                    b64_val = m_enc.group(1)
-                    try:
-                        dec = base64.b64decode(b64_val).decode("utf-16le", errors="ignore").strip()
-                        if dec not in results["decoded_commands"]:
-                            results["decoded_commands"].append(dec)
-                            for fl in self.string_hunter.hunt_flags(dec):
-                                fl["encoding"] = f"EVTX PowerShell EncodedCommand ({fl['encoding']})"
-                                results["flags_found"].append(fl)
-                            if "part" in dec.lower() or "{" in dec or "}" in dec:
-                                results["flags_found"].append({
-                                    "flag": dec,
-                                    "encoding": "EVTX PowerShell Script Fragment",
-                                    "context": dec
-                                })
-                    except Exception:
-                        pass
+            raw_fragments: List[Tuple[Any, str, str]] = []
+            for text_idx, text in enumerate(texts_to_scan):
+                encoding_label = "Latin-1" if text_idx == 0 else "UTF-16LE"
+                event_indicators = [
+                    ("1033", "Software Installation (MsiInstaller)"),
+                    ("4657", "Registry Value Modified"),
+                    ("1074", "System Shutdown / Restart initiated"),
+                    ("7045", "New Service Installed"),
+                    ("4698", "Scheduled Task Created"),
+                    ("1102", "Audit log cleared (Anti-forensics indicator)"),
+                    ("104", "System log cleared (Anti-forensics indicator)"),
+                    ("4720", "User account created"),
+                    ("4781", "Account renamed"),
+                    ("1149", "RDP logon successful"),
+                    ("4104", "PowerShell Script Block execution"),
+                    ("4688", "New process created")
+                ]
+                for eid, desc in event_indicators:
+                    pattern = rf"(?:EventID>|EventID:?\s*){eid}\b"
+                    if re.search(pattern, text) and not any(k["event_id"] == eid for k in results["key_events"]):
+                        results["key_events"].append({"event_id": eid, "description": desc})
 
-            for fl in self.string_hunter.hunt_flags(text):
-                fl["encoding"] = f"Log/EVTX ({fl['encoding']})"
-                results["flags_found"].append(fl)
+                # Extract PowerShell commands
+                ps_commands = re.findall(r"(?:powershell(?:\.exe)?|pwsh)\s+([^\r\n]{5,300})", text, re.IGNORECASE)
+                for cmd in set(ps_commands):
+                    if cmd not in results["powershell_scripts"]:
+                        results["powershell_scripts"].append(cmd)
+                    m_enc = re.search(r"(?:-enc|-encodedcommand)\s+([A-Za-z0-9+/=]{12,})", cmd, re.IGNORECASE)
+                    if m_enc:
+                        b64_val = m_enc.group(1)
+                        for dec in _decode_candidate_b64(b64_val):
+                            if dec not in results["decoded_commands"]:
+                                results["decoded_commands"].append(dec)
+
+                # Scan all Base64 candidate tokens in raw text stream
+                b64_tokens = re.findall(r"\b[A-Za-z0-9+/\-_]{8,}={0,2}\b", text)
+                for order_idx, b64_tok in enumerate(b64_tokens):
+                    for dec in _decode_candidate_b64(b64_tok):
+                        raw_fragments.append((order_idx, dec, f"RawStream {encoding_label} Token {order_idx}"))
+
+                # Direct flags in raw stream
+                for fl in self.string_hunter.hunt_flags(text):
+                    fl["encoding"] = f"Log/EVTX Raw ({fl['encoding']})"
+                    results["flags_found"].append(fl)
+
+            if raw_fragments:
+                _reassemble_fragments(raw_fragments)
 
         return results
 
